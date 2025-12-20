@@ -1313,7 +1313,9 @@ static int uniwill_platform_profile_get(struct device *dev, enum platform_profil
 
 	guard(mutex)(&data->profile_lock);
 
-	return data->current_profile;
+	*profile = data->current_profile;
+
+	return 0;
 }
 
 static int uniwill_set_fan_tables(struct uniwill_data *data, struct uniwill_fan_tables *tables)
