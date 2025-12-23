@@ -107,6 +107,9 @@
 
 #define EC_ADDR_BAT_CYCLE_COUNT_2	0x04A7
 
+#define EC_ADDR_CUSTOM_MODE		0x0727
+#define ENABLE_CUSTOM_MODE		BIT(2)
+
 #define EC_ADDR_PROJECT_ID		0x0740
 
 #define EC_ADDR_AP_OEM			0x0741
@@ -328,6 +331,7 @@
 #define UNIWILL_FEATURE_HWMON			BIT(5)
 #define UNIWILL_FEATURE_FAN_TABLE		BIT(6)
 #define UNIWILL_FEATURE_POWER_MODE_LED		BIT(7)
+#define UNIWILL_FEATURE_CUSTOM_MODE		BIT(8)
 
 enum uniwill_fan_mode {
 	FAN_MODE_PERFORMANCE	= 1,
@@ -527,6 +531,7 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 		return true;
 
 	switch (reg) {
+	case EC_ADDR_CUSTOM_MODE:
 	case EC_ADDR_AP_OEM:
 	case EC_ADDR_LIGHTBAR_AC_CTRL:
 	case EC_ADDR_LIGHTBAR_AC_RED:
@@ -562,6 +567,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SECOND_FAN_RPM_1:
 	case EC_ADDR_SECOND_FAN_RPM_2:
 	case EC_ADDR_BAT_ALERT:
+	case EC_ADDR_CUSTOM_MODE:
 	case EC_ADDR_PROJECT_ID:
 	case EC_ADDR_AP_OEM:
 	case EC_ADDR_LIGHTBAR_AC_CTRL:
@@ -1575,7 +1581,15 @@ static int uniwill_ec_init(struct uniwill_data *data)
 	if (ret < 0)
 		return ret;
 
-	return devm_add_action_or_reset(data->dev, uniwill_disable_manual_control, data);
+	ret = devm_add_action_or_reset(data->dev, uniwill_disable_manual_control, data);
+	if (ret < 0)
+		return ret;
+
+	if (!(supported_features & UNIWILL_FEATURE_CUSTOM_MODE))
+		return 0;
+
+	/* Some devices need to explicitly enable access to the fan curve and TDP settings */
+	return regmap_set_bits(data->regmap, EC_ADDR_CUSTOM_MODE, ENABLE_CUSTOM_MODE);
 }
 
 static int uniwill_probe(struct platform_device *pdev)
