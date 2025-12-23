@@ -1431,8 +1431,23 @@ static int uniwill_fan_tables_init(struct uniwill_data *data, enum uniwill_fan_m
 			continue;
 		}
 
-		return regmap_bulk_read(data->regmap, EC_ADDR_CPU_TEMP_END_TABLE, tables,
-					sizeof(*tables));
+		ret = regmap_bulk_read(data->regmap, EC_ADDR_CPU_TEMP_END_TABLE, tables,
+				       sizeof(*tables));
+		if (ret < 0)
+			return ret;
+
+		dev_info(data->dev, "CPU fan table for mode %d:\n", mode);
+		for (int i = 0; i < FAN_TABLE_LENGTH; i++) {
+			dev_info(data->dev, "%d: %u (%u - %u)\n", i, tables->cpu.fan_speed[i],
+				 tables->cpu.lower_temp[i], tables->cpu.upper_temp[i]);
+		}
+		dev_info(data->dev, "GPU fan table for mode %d:\n", mode);
+                for (int i = 0; i < FAN_TABLE_LENGTH; i++) {
+                        dev_info(data->dev, "%d: %u (%u - %u)\n", i, tables->gpu.fan_speed[i],
+                                 tables->gpu.lower_temp[i], tables->gpu.upper_temp[i]);
+                }
+
+		return 0;
 	}
 
 	return -ETIMEDOUT;
