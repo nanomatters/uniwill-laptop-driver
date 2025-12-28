@@ -1,4 +1,5 @@
-CFLAGS_uniwill-laptop.o := -DDEBUG
+CFLAGS_uniwill-acpi.o := -DDEBUG
+CFLAGS_uniwill-wmi.o := -DDEBUG
 obj-m += uniwill-laptop.o
 uniwill-laptop-y := uniwill-acpi.o uniwill-wmi.o
 
