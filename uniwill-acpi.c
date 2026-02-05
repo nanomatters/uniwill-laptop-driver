@@ -635,10 +635,19 @@ static ssize_t fn_lock_show(struct device *dev, struct device_attribute *attr, c
 
 static DEVICE_ATTR_RW(fn_lock);
 
-static int uniwill_enable_super_key_lock(struct uniwill_data *data, bool enable)
+static ssize_t super_key_lock_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
 {
+	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
+	bool enable;
 	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	guard(mutex)(&data->super_key_lock);
 
 	ret = regmap_read(data->regmap, EC_ADDR_SWITCH_STATUS, &value);
 	if (ret < 0)
@@ -649,26 +658,10 @@ static int uniwill_enable_super_key_lock(struct uniwill_data *data, bool enable)
 	 * is already in the correct state.
 	 */
 	if (enable == !(value & SUPER_KEY_LOCK_STATUS))
-		return 0;
+		return count;
 
-	return regmap_write_bits(data->regmap, EC_ADDR_TRIGGER, TRIGGER_SUPER_KEY_LOCK,
-				 TRIGGER_SUPER_KEY_LOCK);
-}
-
-static ssize_t super_key_lock_store(struct device *dev, struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct uniwill_data *data = dev_get_drvdata(dev);
-	bool enable;
-	int ret;
-
-	ret = kstrtobool(buf, &enable);
-	if (ret < 0)
-		return ret;
-
-	guard(mutex)(&data->super_key_lock);
-
-	ret = uniwill_enable_super_key_lock(data, enable);
+	ret = regmap_write_bits(data->regmap, EC_ADDR_TRIGGER, TRIGGER_SUPER_KEY_LOCK,
+				TRIGGER_SUPER_KEY_LOCK);
 	if (ret < 0)
 		return ret;
 
@@ -1355,35 +1348,16 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 {
 	struct uniwill_data *data = container_of(nb, struct uniwill_data, nb);
 	struct uniwill_battery_entry *entry;
-	int ret;
 
 	switch (action) {
 	case UNIWILL_OSD_SUPER_KEY_LOCK_ENABLE:
-		if (!uniwill_device_supports(data, UNIWILL_FEATURE_SUPER_KEY_LOCK))
-			return NOTIFY_DONE;
-
-		mutex_lock(&data->super_key_lock);
-		/* Some machines do not update the state themselfs */
-		ret = uniwill_enable_super_key_lock(data, true);
-		if (ret >= 0)
-			sysfs_notify(&data->dev->kobj, NULL, "super_key_lock");
-
-		mutex_unlock(&data->super_key_lock);
-
-		return notifier_from_errno(ret);
 	case UNIWILL_OSD_SUPER_KEY_LOCK_DISABLE:
 		if (!uniwill_device_supports(data, UNIWILL_FEATURE_SUPER_KEY_LOCK))
 			return NOTIFY_DONE;
 
-		mutex_lock(&data->super_key_lock);
-		/* Some machines do not update the state themselfs */
-		ret = uniwill_enable_super_key_lock(data, false);
-		if (ret >= 0)
-			sysfs_notify(&data->dev->kobj, NULL, "super_key_lock");
+		sysfs_notify(&data->dev->kobj, NULL, "super_key_lock");
 
-		mutex_unlock(&data->super_key_lock);
-
-		return notifier_from_errno(ret);
+		return NOTIFY_OK;
 	case UNIWILL_OSD_BATTERY_ALERT:
 		if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY))
 			return NOTIFY_DONE;
@@ -1631,9 +1605,6 @@ static int uniwill_resume_super_key_lock(struct uniwill_data *data)
 	if (!uniwill_device_supports(data, UNIWILL_FEATURE_SUPER_KEY_LOCK))
 		return 0;
 
-	/* We have to prevent races with the WMI notifier */
-	guard(mutex)(&data->super_key_lock);
-
 	ret = regmap_read(data->regmap, EC_ADDR_SWITCH_STATUS, &value);
 	if (ret < 0)
 		return ret;
@@ -1717,7 +1688,7 @@ static struct uniwill_device_descriptor lapac71h_descriptor __initdata = {
 		    UNIWILL_FEATURE_SUPER_KEY_LOCK |
 		    UNIWILL_FEATURE_TOUCHPAD_TOGGLE |
 		    UNIWILL_FEATURE_BATTERY |
-		    UNIWILL_FEATURE_HWMON
+		    UNIWILL_FEATURE_HWMON,
 };
 
 static struct uniwill_device_descriptor lapkc71f_descriptor __initdata = {
@@ -1726,7 +1697,7 @@ static struct uniwill_device_descriptor lapkc71f_descriptor __initdata = {
 		    UNIWILL_FEATURE_TOUCHPAD_TOGGLE |
 		    UNIWILL_FEATURE_LIGHTBAR |
 		    UNIWILL_FEATURE_BATTERY |
-		    UNIWILL_FEATURE_HWMON
+		    UNIWILL_FEATURE_HWMON,
 };
 
 static int phxarx1_phxaqf1_probe(struct uniwill_data *data)
@@ -1745,11 +1716,11 @@ static int phxarx1_phxaqf1_probe(struct uniwill_data *data)
 };
 
 static struct uniwill_device_descriptor phxarx1_phxaqf1_descriptor __initdata = {
-	.probe = phxarx1_phxaqf1_probe
+	.probe = phxarx1_phxaqf1_probe,
 };
 
 static struct uniwill_device_descriptor tux_featureset_1_descriptor __initdata = {
-	.features = UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL
+	.features = UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL,
 };
 
 static struct uniwill_device_descriptor empty_descriptor __initdata = {};
