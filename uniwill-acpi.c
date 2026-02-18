@@ -112,6 +112,9 @@
 
 #define EC_ADDR_BAT_CYCLE_COUNT_2	0x04A7
 
+#define EC_ADDR_OEM_9			0x0726
+#define AC_AUTO_BOOT_ENABLE		BIT(3)
+
 #define EC_ADDR_PROJECT_ID		0x0740
 #define PROJECT_ID_NONE			0x00
 #define PROJECT_ID_GI			0x01
@@ -363,6 +366,8 @@
 #define UNIWILL_FEATURE_SECONDARY_FAN		BIT(9)
 #define UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL	BIT(10)
 #define UNIWILL_FEATURE_KEYBOARD_BACKLIGHT	BIT(11)
+#define UNIWILL_FEATURE_AC_AUTO_BOOT		BIT(12)
+#define UNIWILL_FEATURE_USB_POWERSHARE		BIT(13)
 
 struct uniwill_data {
 	struct device *dev;
@@ -375,6 +380,7 @@ struct uniwill_data {
 	struct mutex battery_lock;	/* Protects the list of currently registered batteries */
 	unsigned int last_status;
 	unsigned int last_switch_status;
+	unsigned int last_trigger;
 	struct mutex super_key_lock;	/* Protects the toggling of the super key lock state */
 	struct list_head batteries;
 	struct mutex led_lock;		/* Protects writes to the lightbar registers */
@@ -382,9 +388,10 @@ struct uniwill_data {
 	struct mc_subled led_mc_subled_info[LED_CHANNELS];
 	bool single_color_kbd;
 	unsigned int last_kbd_status;
-	struct mutex kbd_led_lock;	/* Protects writes to the keyboard backlight registers */
 	union {
 		struct {
+			/* Protects writes to the RGB keyboard backlight registers */
+			struct mutex kbd_rgb_led_lock;
 			struct led_classdev_mc kbd_led_mc_cdev;
 			struct mc_subled kbd_led_mc_subled_info[KBD_LED_CHANNELS];
 		};
@@ -598,6 +605,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SECOND_FAN_RPM_1:
 	case EC_ADDR_SECOND_FAN_RPM_2:
 	case EC_ADDR_BAT_ALERT:
+	case EC_ADDR_OEM_9:
 	case EC_ADDR_PROJECT_ID:
 	case EC_ADDR_AP_OEM:
 	case EC_ADDR_LIGHTBAR_AC_CTRL:
@@ -640,6 +648,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SECOND_FAN_RPM_1:
 	case EC_ADDR_SECOND_FAN_RPM_2:
 	case EC_ADDR_BAT_ALERT:
+	case EC_ADDR_OEM_9:
 	case EC_ADDR_BIOS_OEM:
 	case EC_ADDR_PWM_1:
 	case EC_ADDR_PWM_2:
@@ -916,6 +925,88 @@ static ssize_t ctgp_offset_show(struct device *dev, struct device_attribute *att
 
 static DEVICE_ATTR_RW(ctgp_offset);
 
+static ssize_t ac_auto_boot_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int regval;
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	if (enable)
+		regval = AC_AUTO_BOOT_ENABLE;
+	else
+		regval = 0;
+
+	ret = regmap_update_bits(data->regmap, EC_ADDR_OEM_9, AC_AUTO_BOOT_ENABLE, regval);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static ssize_t ac_auto_boot_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int regval;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_OEM_9, &regval);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", !!(regval & AC_AUTO_BOOT_ENABLE));
+}
+
+static DEVICE_ATTR_RW(ac_auto_boot);
+
+static ssize_t usb_powershare_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int regval;
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	if (enable)
+		regval = TRIGGER_USB_CHARGING;
+	else
+		regval = 0;
+
+	/*
+	 * Normaly this RMW-sequence could also trigger the super key toggle,
+	 * but the EC seems to take care that those bits are always read as 0.
+	 */
+	ret = regmap_update_bits(data->regmap, EC_ADDR_TRIGGER, TRIGGER_USB_CHARGING, regval);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static ssize_t usb_powershare_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int regval;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_TRIGGER, &regval);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", !!(regval & TRIGGER_USB_CHARGING));
+}
+
+static DEVICE_ATTR_RW(usb_powershare);
+
 static int uniwill_nvidia_ctgp_init(struct uniwill_data *data)
 {
 	int ret;
@@ -953,6 +1044,8 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_breathing_in_suspend.attr,
 	/* Power-management-related */
 	&dev_attr_ctgp_offset.attr,
+	&dev_attr_ac_auto_boot.attr,
+	&dev_attr_usb_powershare.attr,
 	NULL
 };
 
@@ -984,6 +1077,16 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 
 	if (attr == &dev_attr_ctgp_offset.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_ac_auto_boot.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_AC_AUTO_BOOT))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_usb_powershare.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_USB_POWERSHARE))
 			return attr->mode;
 	}
 
@@ -1323,20 +1426,15 @@ static int uniwill_notify_kbd_led(struct uniwill_data *data, int brightness)
 	return 0;
 }
 
+#define KBD_LED_MASK	(KBD_BRIGHTNESS_MASK | KBD_APPLY | KBD_POWER_OFF)
+
 static int uniwill_kbd_led_write_brightness(struct uniwill_data *data, int brightness)
 {
-	unsigned int regval;
-	int ret;
+	/* KBD_POWER_OFF is always implicitly cleared */
+	unsigned int regval = FIELD_PREP(KBD_BRIGHTNESS_MASK, brightness) | KBD_APPLY;
 
-	ret = regmap_read(data->regmap, EC_ADDR_KBD_STATUS, &regval);
-	if (ret < 0)
-		return ret;
-
-	FIELD_MODIFY(KBD_BRIGHTNESS_MASK, &regval, brightness);
-	regval |= KBD_APPLY;
-	regval &= ~KBD_POWER_OFF;
-
-	return regmap_write(data->regmap, EC_ADDR_KBD_STATUS, regval);
+	/* We must ensure that the "apply" bit is always written */
+	return regmap_write_bits(data->regmap, EC_ADDR_KBD_STATUS, KBD_LED_MASK, regval);
 }
 
 static int uniwill_kbd_led_read_brightness(struct uniwill_data *data)
@@ -1355,8 +1453,6 @@ static int uniwill_kbd_led_brightness_set(struct led_classdev *led_cdev,
 					  enum led_brightness brightness)
 {
 	struct uniwill_data *data = container_of(led_cdev, struct uniwill_data, kbd_led_cdev);
-
-	guard(mutex)(&data->kbd_led_lock);
 
 	return uniwill_kbd_led_write_brightness(data, brightness);
 }
@@ -1383,7 +1479,7 @@ static int uniwill_kbd_led_mc_brightness_set(struct led_classdev *led_cdev,
 	unsigned int regval;
 	int ret;
 
-	guard(mutex)(&data->kbd_led_lock);
+	guard(mutex)(&data->kbd_rgb_led_lock);
 
 	/*
 	 * The EC interprets a RGB value of 0x000000 as a command to restore
@@ -1436,10 +1532,6 @@ static int uniwill_kbd_led_init(struct uniwill_data *data)
 
 	if (!uniwill_device_supports(data, UNIWILL_FEATURE_KEYBOARD_BACKLIGHT))
 		return 0;
-
-	ret = devm_mutex_init(data->dev, &data->kbd_led_lock);
-	if (ret < 0)
-		return ret;
 
 	ret = regmap_read(data->regmap, EC_ADDR_KBD_STATUS, &regval);
 	if (ret < 0)
@@ -1509,6 +1601,10 @@ static int uniwill_kbd_led_init(struct uniwill_data *data)
 		if (ret < 0)
 			return ret;
 	}
+
+	ret = devm_mutex_init(data->dev, &data->kbd_rgb_led_lock);
+	if (ret < 0)
+		return ret;
 
 	init_data.default_label = "multicolor:" LED_FUNCTION_KBD_BACKLIGHT;
 	data->kbd_led_mc_cdev.led_cdev.max_brightness = KBD_LED_MAX_BRIGHTNESS;
@@ -2026,6 +2122,19 @@ static int uniwill_suspend_kbd_led(struct uniwill_data *data)
 	return regmap_write(data->regmap, EC_ADDR_KBD_STATUS, regval);
 }
 
+static int uniwill_suspend_usb_powershare(struct uniwill_data *data)
+{
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_USB_POWERSHARE))
+		return 0;
+
+	/*
+	 * Save the current usb powershare setting in order to restore it during
+	 * resume. We cannot use the regmap code for that since this register needs
+	 * to be declared as volatile.
+	 */
+	return regmap_read(data->regmap, EC_ADDR_TRIGGER, &data->last_trigger);
+}
+
 static int uniwill_suspend_nvidia_ctgp(struct uniwill_data *data)
 {
 	if (!uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
@@ -2053,6 +2162,10 @@ static int uniwill_suspend(struct device *dev)
 		return ret;
 
 	ret = uniwill_suspend_kbd_led(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_suspend_usb_powershare(data);
 	if (ret < 0)
 		return ret;
 
@@ -2120,6 +2233,15 @@ static int uniwill_resume_kbd_led(struct uniwill_data *data)
 	return regmap_write_bits(data->regmap, EC_ADDR_TRIGGER, RGB_APPLY_COLOR, RGB_APPLY_COLOR);
 }
 
+static int uniwill_resume_usb_powershare(struct uniwill_data *data)
+{
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_USB_POWERSHARE))
+		return 0;
+
+	return regmap_update_bits(data->regmap, EC_ADDR_TRIGGER, TRIGGER_USB_CHARGING,
+				  data->last_trigger);
+}
+
 static int uniwill_resume_nvidia_ctgp(struct uniwill_data *data)
 {
 	if (!uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
@@ -2153,6 +2275,10 @@ static int uniwill_resume(struct device *dev)
 		return ret;
 
 	ret = uniwill_resume_kbd_led(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_resume_usb_powershare(data);
 	if (ret < 0)
 		return ret;
 
@@ -2230,7 +2356,9 @@ static struct uniwill_device_descriptor xxkk4nax_xxsp4nax_descriptor __initdata 
 		    UNIWILL_FEATURE_BATTERY_CHARGE_MODES |
 		    UNIWILL_FEATURE_CPU_TEMP |
 		    UNIWILL_FEATURE_PRIMARY_FAN |
-		    UNIWILL_FEATURE_SECONDARY_FAN,
+		    UNIWILL_FEATURE_SECONDARY_FAN |
+		    UNIWILL_FEATURE_AC_AUTO_BOOT |
+		    UNIWILL_FEATURE_USB_POWERSHARE,
 };
 
 static struct uniwill_device_descriptor tux_featureset_1_descriptor __initdata = {
