@@ -280,6 +280,10 @@
 
 #define EC_ADDR_OEM_4			0x07A6
 #define OVERBOOST_DYN_TEMP_OFF		BIT(1)
+#define CHARGING_PROFILE_MASK		GENMASK(5, 4)
+#define CHARGING_PROFILE_HIGH_CAPACITY	0x00
+#define CHARGING_PROFILE_BALANCED	0x01
+#define CHARGING_PROFILE_STATIONARY	0x02
 #define TOUCHPAD_TOGGLE_OFF		BIT(6)
 
 #define EC_ADDR_CHARGE_CTRL		0x07B9
@@ -350,13 +354,15 @@
 #define UNIWILL_FEATURE_SUPER_KEY		BIT(1)
 #define UNIWILL_FEATURE_TOUCHPAD_TOGGLE		BIT(2)
 #define UNIWILL_FEATURE_LIGHTBAR		BIT(3)
-#define UNIWILL_FEATURE_BATTERY			BIT(4)
-#define UNIWILL_FEATURE_CPU_TEMP		BIT(5)
-#define UNIWILL_FEATURE_GPU_TEMP		BIT(6)
-#define UNIWILL_FEATURE_PRIMARY_FAN		BIT(7)
-#define UNIWILL_FEATURE_SECONDARY_FAN		BIT(8)
-#define UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL	BIT(9)
-#define UNIWILL_FEATURE_KEYBOARD_BACKLIGHT	BIT(10)
+#define UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT	BIT(4)
+/* Mutually exclusive with the charge limit feature */
+#define UNIWILL_FEATURE_BATTERY_CHARGE_MODES	BIT(5)
+#define UNIWILL_FEATURE_CPU_TEMP		BIT(6)
+#define UNIWILL_FEATURE_GPU_TEMP		BIT(7)
+#define UNIWILL_FEATURE_PRIMARY_FAN		BIT(8)
+#define UNIWILL_FEATURE_SECONDARY_FAN		BIT(9)
+#define UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL	BIT(10)
+#define UNIWILL_FEATURE_KEYBOARD_BACKLIGHT	BIT(11)
 
 struct uniwill_data {
 	struct device *dev;
@@ -1527,6 +1533,24 @@ static int uniwill_get_property(struct power_supply *psy, const struct power_sup
 	int ret;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_TYPES:
+		ret = regmap_read(data->regmap, EC_ADDR_OEM_4, &regval);
+		if (ret < 0)
+			return ret;
+
+		switch (FIELD_GET(CHARGING_PROFILE_MASK, regval)) {
+		case CHARGING_PROFILE_HIGH_CAPACITY:
+			val->intval = POWER_SUPPLY_CHARGE_TYPE_STANDARD;
+			return 0;
+		case CHARGING_PROFILE_BALANCED:
+			val->intval = POWER_SUPPLY_CHARGE_TYPE_LONGLIFE;
+			return 0;
+		case CHARGING_PROFILE_STATIONARY:
+			val->intval = POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
+			return 0;
+		default:
+			return -EPROTO;
+		}
 	case POWER_SUPPLY_PROP_HEALTH:
 		ret = power_supply_get_property_direct(psy, POWER_SUPPLY_PROP_PRESENT, &prop);
 		if (ret < 0)
@@ -1580,8 +1604,26 @@ static int uniwill_set_property(struct power_supply *psy, const struct power_sup
 				const union power_supply_propval *val)
 {
 	struct uniwill_data *data = drvdata;
+	unsigned int regval;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_TYPES:
+		switch (val->intval) {
+		case POWER_SUPPLY_CHARGE_TYPE_TRICKLE:
+			regval = FIELD_PREP(CHARGING_PROFILE_MASK, CHARGING_PROFILE_STATIONARY);
+			break;
+		case POWER_SUPPLY_CHARGE_TYPE_STANDARD:
+			regval = FIELD_PREP(CHARGING_PROFILE_MASK, CHARGING_PROFILE_HIGH_CAPACITY);
+			break;
+		case POWER_SUPPLY_CHARGE_TYPE_LONGLIFE:
+			regval = FIELD_PREP(CHARGING_PROFILE_MASK, CHARGING_PROFILE_BALANCED);
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		return regmap_update_bits(data->regmap, EC_ADDR_OEM_4, CHARGING_PROFILE_MASK,
+					  regval);
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 		if (val->intval < 0 || val->intval > 100)
 			return -EINVAL;
@@ -1597,21 +1639,41 @@ static int uniwill_property_is_writeable(struct power_supply *psy,
 					 const struct power_supply_ext *ext, void *drvdata,
 					 enum power_supply_property psp)
 {
-	if (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
+	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_TYPES:
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 		return true;
-
-	return false;
+	default:
+		return false;
+	}
 }
 
-static const enum power_supply_property uniwill_properties[] = {
+static const enum power_supply_property uniwill_charge_limit_properties[] = {
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
 };
 
-static const struct power_supply_ext uniwill_extension = {
+static const struct power_supply_ext uniwill_charge_limit_extension = {
 	.name = DRIVER_NAME,
-	.properties = uniwill_properties,
-	.num_properties = ARRAY_SIZE(uniwill_properties),
+	.properties = uniwill_charge_limit_properties,
+	.num_properties = ARRAY_SIZE(uniwill_charge_limit_properties),
+	.get_property = uniwill_get_property,
+	.set_property = uniwill_set_property,
+	.property_is_writeable = uniwill_property_is_writeable,
+};
+
+static const enum power_supply_property uniwill_charge_modes_properties[] = {
+	POWER_SUPPLY_PROP_CHARGE_TYPES,
+	POWER_SUPPLY_PROP_HEALTH,
+};
+
+static const struct power_supply_ext uniwill_charge_modes_extension = {
+	.name = DRIVER_NAME,
+	.charge_types = BIT(POWER_SUPPLY_CHARGE_TYPE_TRICKLE) |
+			BIT(POWER_SUPPLY_CHARGE_TYPE_STANDARD) |
+			BIT(POWER_SUPPLY_CHARGE_TYPE_LONGLIFE),
+	.properties = uniwill_charge_modes_properties,
+	.num_properties = ARRAY_SIZE(uniwill_charge_modes_properties),
 	.get_property = uniwill_get_property,
 	.set_property = uniwill_set_property,
 	.property_is_writeable = uniwill_property_is_writeable,
@@ -1627,7 +1689,13 @@ static int uniwill_add_battery(struct power_supply *battery, struct acpi_battery
 	if (!entry)
 		return -ENOMEM;
 
-	ret = power_supply_register_extension(battery, &uniwill_extension, data->dev, data);
+	if (uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
+		ret = power_supply_register_extension(battery, &uniwill_charge_limit_extension,
+						      data->dev, data);
+	else
+		ret = power_supply_register_extension(battery, &uniwill_charge_modes_extension,
+						      data->dev, data);
+
 	if (ret < 0) {
 		kfree(entry);
 		return ret;
@@ -1656,7 +1724,10 @@ static int uniwill_remove_battery(struct power_supply *battery, struct acpi_batt
 		}
 	}
 
-	power_supply_unregister_extension(battery, &uniwill_extension);
+	if (uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
+		power_supply_unregister_extension(battery, &uniwill_charge_limit_extension);
+	else
+		power_supply_unregister_extension(battery, &uniwill_charge_modes_extension);
 
 	return 0;
 }
@@ -1666,27 +1737,29 @@ static int uniwill_battery_init(struct uniwill_data *data)
 	unsigned int value, threshold;
 	int ret;
 
-	if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY))
-		return 0;
-
-	ret = regmap_read(data->regmap, EC_ADDR_CHARGE_CTRL, &value);
-	if (ret < 0)
-		return ret;
-
-	/*
-	 * The charge control threshold might be initialized with 0 by
-	 * the EC to signal that said threshold is uninitialized. We thus
-	 * need to replace this value with 100 to signal that we want to
-	 * take control of battery charging. For the sake of completeness
-	 * we also set the charging threshold to 100 if the EC-provided
-	 * value is invalid.
-	 */
-	threshold = FIELD_GET(CHARGE_CTRL_MASK, value);
-	if (threshold == 0 || threshold > 100) {
-		FIELD_MODIFY(CHARGE_CTRL_MASK, &value, 100);
-		ret = regmap_write(data->regmap, EC_ADDR_CHARGE_CTRL, value);
+	if (uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT)) {
+		ret = regmap_read(data->regmap, EC_ADDR_CHARGE_CTRL, &value);
 		if (ret < 0)
 			return ret;
+
+		/*
+		 * The charge control threshold might be initialized with 0 by
+		 * the EC to signal that said threshold is uninitialized. We thus
+		 * need to replace this value with 100 to signal that we want to
+		 * take control of battery charging. For the sake of completeness
+		 * we also set the charging threshold to 100 if the EC-provided
+		 * value is invalid.
+		 */
+		threshold = FIELD_GET(CHARGE_CTRL_MASK, value);
+		if (threshold == 0 || threshold > 100) {
+			FIELD_MODIFY(CHARGE_CTRL_MASK, &value, 100);
+			ret = regmap_write(data->regmap, EC_ADDR_CHARGE_CTRL, value);
+			if (ret < 0)
+				return ret;
+		}
+	} else {
+		if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_MODES))
+			return 0;
 	}
 
 	ret = devm_mutex_init(data->dev, &data->battery_lock);
@@ -1709,7 +1782,8 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 
 	switch (action) {
 	case UNIWILL_OSD_BATTERY_ALERT:
-		if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY))
+		if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT) &&
+		    !uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_MODES))
 			return NOTIFY_DONE;
 
 		mutex_lock(&data->battery_lock);
@@ -1916,7 +1990,7 @@ static int uniwill_suspend_super_key(struct uniwill_data *data)
 
 static int uniwill_suspend_battery(struct uniwill_data *data)
 {
-	if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY))
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
 		return 0;
 
 	/*
@@ -2022,7 +2096,7 @@ static int uniwill_resume_super_key(struct uniwill_data *data)
 
 static int uniwill_resume_battery(struct uniwill_data *data)
 {
-	if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY))
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
 		return 0;
 
 	return regmap_update_bits(data->regmap, EC_ADDR_CHARGE_CTRL, CHARGE_CTRL_MASK,
@@ -2112,7 +2186,7 @@ static struct uniwill_device_descriptor lapac71h_descriptor __initdata = {
 	.features = UNIWILL_FEATURE_FN_LOCK |
 		    UNIWILL_FEATURE_SUPER_KEY |
 		    UNIWILL_FEATURE_TOUCHPAD_TOGGLE |
-		    UNIWILL_FEATURE_BATTERY |
+		    UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT |
 		    UNIWILL_FEATURE_CPU_TEMP |
 		    UNIWILL_FEATURE_GPU_TEMP |
 		    UNIWILL_FEATURE_PRIMARY_FAN |
@@ -2124,7 +2198,7 @@ static struct uniwill_device_descriptor lapkc71f_descriptor __initdata = {
 		    UNIWILL_FEATURE_SUPER_KEY |
 		    UNIWILL_FEATURE_TOUCHPAD_TOGGLE |
 		    UNIWILL_FEATURE_LIGHTBAR |
-		    UNIWILL_FEATURE_BATTERY |
+		    UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT |
 		    UNIWILL_FEATURE_CPU_TEMP |
 		    UNIWILL_FEATURE_GPU_TEMP |
 		    UNIWILL_FEATURE_PRIMARY_FAN |
@@ -2153,11 +2227,10 @@ static struct uniwill_device_descriptor phxarx1_phxaqf1_descriptor __initdata = 
 static struct uniwill_device_descriptor xxkk4nax_xxsp4nax_descriptor __initdata = {
 	.features = UNIWILL_FEATURE_FN_LOCK |
 		    UNIWILL_FEATURE_SUPER_KEY |
-		    UNIWILL_FEATURE_BATTERY |
+		    UNIWILL_FEATURE_BATTERY_CHARGE_MODES |
 		    UNIWILL_FEATURE_CPU_TEMP |
 		    UNIWILL_FEATURE_PRIMARY_FAN |
-		    UNIWILL_FEATURE_SECONDARY_FAN |
-		    UNIWILL_FEATURE_KEYBOARD_BACKLIGHT,
+		    UNIWILL_FEATURE_SECONDARY_FAN,
 };
 
 static struct uniwill_device_descriptor tux_featureset_1_descriptor __initdata = {
@@ -2616,8 +2689,8 @@ static int __init uniwill_init(void)
 	}
 
 	if (force) {
-		/* Assume that the device supports all features */
-		device_descriptor.features = UINT_MAX;
+		/* Assume that the device supports all features except the charge limit */
+		device_descriptor.features = UINT_MAX & ~UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT;
 		pr_warn("Enabling potentially unsupported features\n");
 	}
 
