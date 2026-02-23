@@ -1432,9 +1432,19 @@ static int uniwill_kbd_led_write_brightness(struct uniwill_data *data, int brigh
 {
 	/* KBD_POWER_OFF is always implicitly cleared */
 	unsigned int regval = FIELD_PREP(KBD_BRIGHTNESS_MASK, brightness) | KBD_APPLY;
+	int ret;
 
 	/* We must ensure that the "apply" bit is always written */
-	return regmap_write_bits(data->regmap, EC_ADDR_KBD_STATUS, KBD_LED_MASK, regval);
+	ret = regmap_write_bits(data->regmap, EC_ADDR_KBD_STATUS, KBD_LED_MASK, regval);
+	if (ret < 0)
+		return ret;
+
+	/* WIP: For testing purposes only */
+	ret = regmap_write_bits(data->regmap, EC_ADDR_KBD_STATUS, KBD_APPLY, 0);
+	if (ret < 0)
+		return ret;
+
+	return regmap_write_bits(data->regmap, EC_ADDR_KBD_STATUS, KBD_APPLY, 1);
 }
 
 static int uniwill_kbd_led_read_brightness(struct uniwill_data *data)
