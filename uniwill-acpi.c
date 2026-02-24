@@ -1440,11 +1440,11 @@ static int uniwill_kbd_led_write_brightness(struct uniwill_data *data, int brigh
 		return ret;
 
 	/* WIP: For testing purposes only */
-	ret = regmap_write_bits(data->regmap, EC_ADDR_KBD_STATUS, KBD_APPLY, 0);
+	ret = regmap_write_bits(data->regmap, EC_ADDR_KBD_STATUS, KBD_APPLY | KBD_POWER_OFF, KBD_APPLY | KBD_POWER_OFF);
 	if (ret < 0)
 		return ret;
 
-	return regmap_write_bits(data->regmap, EC_ADDR_KBD_STATUS, KBD_APPLY, 1);
+	return regmap_write_bits(data->regmap, EC_ADDR_KBD_STATUS, KBD_APPLY | KBD_POWER_OFF, KBD_APPLY);
 }
 
 static int uniwill_kbd_led_read_brightness(struct uniwill_data *data)
