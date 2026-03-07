@@ -43,6 +43,12 @@ Support for changing the platform performance mode is currently not implemented.
 Battery Charging Control
 ------------------------
 
+.. warning:: Some devices do not properly implement the charging threshold interface. Forcing
+             the driver to enable access to said interface on such devices might damage the
+             battery [1]_. Because of this the driver will not enable said feature even when
+             using the ``force`` module parameter. The charging profile interface will be
+             available instead.
+
 The ``uniwill-laptop`` driver supports controlling the battery charge limit. This either happens
 over the standard ``charge_control_end_threshold`` or ``charge_types`` power supply sysfs attribute,
 depending on the device. When using the ``charge_control_end_threshold`` sysfs attribute, all values
@@ -57,6 +63,10 @@ attribute (0 means that the battery is currently not charging).
 
 Additionally the driver signals the presence of battery charging issues through the standard
 ``health`` power supply sysfs attribute.
+
+It also let you set whether an USB-C power source should prioritise charging the battery or
+delivering immediate power to the cpu. See Documentation/ABI/testing/sysfs-driver-uniwill-laptop for
+details.
 
 Lightbar
 --------
@@ -80,6 +90,18 @@ Keep in mind that due to hardware design choices, the driver does not support th
 ``0x000000`` (black), instead it will fall back to ``0x010101`` (faint white). In order to
 disable the keyboard backlight, the standard LED brightness setting has to be used instead.
 
+Additionally, on some devices the brightness of the keyboard backlight can only be controlled
+after having pressed the associated hotkey at least once. This seems to be an issue with the
+EC firmware, not with the driver itself.
+
+Configurable TGP
+--------
+
+The ``uniwill-laptop`` driver allows to set the configurable TGP for devices with NVIDIA GPUs that
+allow it.
+
+See Documentation/ABI/testing/sysfs-driver-uniwill-laptop for details.
+
 AC Auto Boot
 ------------
 
@@ -93,3 +115,8 @@ USB Powershare
 The ``uniwill-laptop`` driver allows the user to configure if the system should continue to
 provide power via the USB ports when hibernating or powered off, see
 Documentation/ABI/testing/sysfs-driver-uniwill-laptop for details.
+
+References
+==========
+
+.. [1] https://www.reddit.com/r/XMG_gg/comments/ld9yyf/battery_limit_hidden_function_discovered_on/
