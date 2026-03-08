@@ -2461,6 +2461,20 @@ static struct platform_driver uniwill_driver = {
 	.shutdown = uniwill_shutdown,
 };
 
+static struct uniwill_device_descriptor machenike_l16p_descriptor __initdata = {
+	.features = UNIWILL_FEATURE_FN_LOCK |
+		    UNIWILL_FEATURE_SUPER_KEY |
+		    UNIWILL_FEATURE_CPU_TEMP |
+		    UNIWILL_FEATURE_GPU_TEMP |
+		    UNIWILL_FEATURE_PRIMARY_FAN |
+		    UNIWILL_FEATURE_SECONDARY_FAN |
+		    UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL |
+		    UNIWILL_FEATURE_KEYBOARD_BACKLIGHT |
+		    UNIWILL_FEATURE_AC_AUTO_BOOT |
+		    UNIWILL_FEATURE_USB_POWERSHARE,
+	.kbd_led_max_brightness = 4,
+};
+
 static struct uniwill_device_descriptor lapqc71a_lapqc71b_descriptor __initdata = {
 	.features = UNIWILL_FEATURE_SUPER_KEY |
 		    UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT |
@@ -2609,7 +2623,36 @@ static struct uniwill_device_descriptor pf5pu1g_descriptor __initdata = {
 		    UNIWILL_FEATURE_PRIMARY_FAN,
 };
 
+static struct uniwill_device_descriptor x4sp4nal_descriptor __initdata = {
+	.features = UNIWILL_FEATURE_FN_LOCK |
+		    UNIWILL_FEATURE_SUPER_KEY |
+		    UNIWILL_FEATURE_BATTERY_CHARGE_MODES |
+		    UNIWILL_FEATURE_CPU_TEMP |
+		    UNIWILL_FEATURE_PRIMARY_FAN |
+		    UNIWILL_FEATURE_SECONDARY_FAN |
+		    UNIWILL_FEATURE_KEYBOARD_BACKLIGHT |
+		    UNIWILL_FEATURE_AC_AUTO_BOOT |
+		    UNIWILL_FEATURE_USB_POWERSHARE,
+	.kbd_led_max_brightness = 2,
+};
+
 static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
+	{
+		.ident = "AiStone X4SP4NAL",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "AiStone"),
+			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X4SP4NAL"),
+		},
+		.driver_data = &x4sp4nal_descriptor,
+	},
+	{
+		.ident = "MACHENIKE L16 Pro",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "MACHENIKE"),
+			DMI_EXACT_MATCH(DMI_BOARD_NAME, "L16P"),
+		},
+		.driver_data = &machenike_l16p_descriptor,
+	},
 	{
 		.ident = "XMG FUSION 15 (L19)",
 		.matches = {
