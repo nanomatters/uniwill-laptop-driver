@@ -90,10 +90,6 @@ Keep in mind that due to hardware design choices, the driver does not support th
 ``0x000000`` (black), instead it will fall back to ``0x010101`` (faint white). In order to
 disable the keyboard backlight, the standard LED brightness setting has to be used instead.
 
-Additionally, on some devices the brightness of the keyboard backlight can only be controlled
-after having pressed the associated hotkey at least once. This seems to be an issue with the
-EC firmware, not with the driver itself.
-
 Configurable TGP
 --------
 
