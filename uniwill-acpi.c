@@ -348,7 +348,6 @@
 #define FAN_TABLE_LENGTH	16
 
 #define LED_CHANNELS		3
-#define LED_MAX_BRIGHTNESS	200
 
 #define KBD_LED_CHANNELS	3
 #define KBD_LED_MAX_INTENSITY	50
@@ -390,6 +389,7 @@ struct uniwill_data {
 	struct mutex super_key_lock;	/* Protects the toggling of the super key lock state */
 	struct list_head batteries;
 	struct mutex led_lock;		/* Protects writes to the lightbar registers */
+	unsigned int lightbar_max_brightness;
 	struct led_classdev_mc led_mc_cdev;
 	struct mc_subled led_mc_subled_info[LED_CHANNELS];
 	bool single_color_kbd;
@@ -419,6 +419,7 @@ struct uniwill_battery_entry {
 struct uniwill_device_descriptor {
 	unsigned int features;
 	unsigned int kbd_led_max_brightness;
+	unsigned int lightbar_max_brightness;
 	/* Executed during driver probing */
 	int (*probe)(struct uniwill_data *data);
 };
@@ -1417,7 +1418,7 @@ static int uniwill_led_brightness_set(struct led_classdev *led_cdev, enum led_br
 
 	for (int i = 0; i < LED_CHANNELS; i++) {
 		/* Prevent the brightness values from overflowing */
-		value = min(LED_MAX_BRIGHTNESS, data->led_mc_subled_info[i].brightness);
+		value = min(data->lightbar_max_brightness, data->led_mc_subled_info[i].brightness);
 		ret = regmap_write(data->regmap, uniwill_led_channel_to_ac_reg[i], value);
 		if (ret < 0)
 			return ret;
@@ -1486,14 +1487,14 @@ static int uniwill_led_init(struct uniwill_data *data)
 		return ret;
 
 	data->led_mc_cdev.led_cdev.color = LED_COLOR_ID_MULTI;
-	data->led_mc_cdev.led_cdev.max_brightness = LED_MAX_BRIGHTNESS;
+	data->led_mc_cdev.led_cdev.max_brightness = data->lightbar_max_brightness;
 	data->led_mc_cdev.led_cdev.flags = LED_REJECT_NAME_CONFLICT;
 	data->led_mc_cdev.led_cdev.brightness_set_blocking = uniwill_led_brightness_set;
 
 	if (value & LIGHTBAR_S0_OFF)
 		data->led_mc_cdev.led_cdev.brightness = 0;
 	else
-		data->led_mc_cdev.led_cdev.brightness = LED_MAX_BRIGHTNESS;
+		data->led_mc_cdev.led_cdev.brightness = data->lightbar_max_brightness;
 
 	for (int i = 0; i < LED_CHANNELS; i++) {
 		data->led_mc_subled_info[i].color_index = color_indices[i];
@@ -1506,7 +1507,7 @@ static int uniwill_led_init(struct uniwill_data *data)
 		 * Make sure that the initial intensity value is not greater than
 		 * the maximum brightness.
 		 */
-		value = min(LED_MAX_BRIGHTNESS, value);
+		value = min(data->lightbar_max_brightness, value);
 		ret = regmap_write(data->regmap, uniwill_led_channel_to_ac_reg[i], value);
 		if (ret < 0)
 			return ret;
@@ -2159,6 +2160,7 @@ static int uniwill_probe(struct platform_device *pdev)
 
 	data->features = device_descriptor.features;
 	data->kbd_led_max_brightness = device_descriptor.kbd_led_max_brightness;
+	data->lightbar_max_brightness = device_descriptor.lightbar_max_brightness;
 
 	/*
 	 * Some devices might need to perform some device-specific initialization steps
@@ -2477,11 +2479,13 @@ static struct uniwill_device_descriptor machenike_l16p_descriptor __initdata = {
 
 static struct uniwill_device_descriptor lapqc71a_lapqc71b_descriptor __initdata = {
 	.features = UNIWILL_FEATURE_SUPER_KEY |
+		    UNIWILL_FEATURE_LIGHTBAR |
 		    UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT |
 		    UNIWILL_FEATURE_CPU_TEMP |
 		    UNIWILL_FEATURE_GPU_TEMP |
 		    UNIWILL_FEATURE_PRIMARY_FAN |
 		    UNIWILL_FEATURE_SECONDARY_FAN,
+	.lightbar_max_brightness = 36,
 };
 
 static struct uniwill_device_descriptor lapac71h_descriptor __initdata = {
@@ -2505,6 +2509,7 @@ static struct uniwill_device_descriptor lapkc71f_descriptor __initdata = {
 		    UNIWILL_FEATURE_GPU_TEMP |
 		    UNIWILL_FEATURE_PRIMARY_FAN |
 		    UNIWILL_FEATURE_SECONDARY_FAN,
+	.lightbar_max_brightness = 200,
 };
 
 /*
@@ -3122,6 +3127,8 @@ static int __init uniwill_init(void)
 		device_descriptor.features = UINT_MAX & ~UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT;
 		/* Some models only support 3 brightness levels */
 		device_descriptor.kbd_led_max_brightness = 4;
+		/* Some models only support 36 brightness levels per color component */
+		device_descriptor.lightbar_max_brightness = 200;
 		pr_warn("Enabling potentially unsupported features\n");
 	}
 
