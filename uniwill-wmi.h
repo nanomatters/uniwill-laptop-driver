@@ -119,10 +119,18 @@
 
 #define UNIWILL_OSD_KBD_BACKLIGHT_CHANGED	0xF0
 
+/* WMI management interface */
+#define UNIWILL_WMI_MGMT_GUID_BC	"ABBC0F6F-8EA1-11D1-00A0-C90629100000"
+#define UNIWILL_WMI_FUNC_FEATURE_TOGGLE	5
+#define UNIWILL_WMI_LOCAL_DIMMING_ON	0x0E
+#define UNIWILL_WMI_LOCAL_DIMMING_OFF	0x0D
+
 struct device;
 struct notifier_block;
 
 int devm_uniwill_wmi_register_notifier(struct device *dev, struct notifier_block *nb);
+
+int uniwill_wmi_evaluate(u8 function, u32 arg);
 
 int __init uniwill_wmi_register_driver(void);
 

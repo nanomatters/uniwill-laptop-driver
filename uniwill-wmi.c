@@ -17,6 +17,7 @@
 #include <linux/mod_devicetable.h>
 #include <linux/notifier.h>
 #include <linux/printk.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/wmi.h>
 
@@ -43,6 +44,26 @@ int devm_uniwill_wmi_register_notifier(struct device *dev, struct notifier_block
 		return ret;
 
 	return devm_add_action_or_reset(dev, devm_uniwill_wmi_unregister_notifier, nb);
+}
+
+int uniwill_wmi_evaluate(u8 function, u32 arg)
+{
+	u8 buf[40] = {};
+	struct acpi_buffer input = { sizeof(buf), buf };
+	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
+	acpi_status status;
+
+	memcpy(&buf[0], &arg, sizeof(arg));
+	buf[5] = function;
+
+	status = wmi_evaluate_method(UNIWILL_WMI_MGMT_GUID_BC, 0, 0x04,
+				     &input, &output);
+	kfree(output.pointer);
+
+	if (ACPI_FAILURE(status))
+		return -EIO;
+
+	return 0;
 }
 
 static void uniwill_wmi_notify(struct wmi_device *wdev, union acpi_object *obj)

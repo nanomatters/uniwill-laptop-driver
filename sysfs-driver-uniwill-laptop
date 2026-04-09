@@ -101,3 +101,16 @@ Description:
 		at the same time is not supported.
 
 		Reading this file returns the current status of the USB powershare functionality.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/mini_led_local_dimming
+Date:		July 2025
+KernelVersion:	7.2
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Allows userspace applications to enable/disable the mini LED local dimming feature
+		of the display panel. Writing "1"/"0" into this file enables/disables this
+		functionality.
+
+		This attribute is only available on devices with a mini LED display which supports
+		local dimming. The current state cannot be read from hardware, so reading this file
+		returns the last written value.
