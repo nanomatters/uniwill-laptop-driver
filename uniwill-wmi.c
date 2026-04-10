@@ -66,6 +66,49 @@ int uniwill_wmi_evaluate(u8 function, u32 arg)
 	return 0;
 }
 
+/*
+ * Write a single byte to the EC RAM using WMI method 0x04.
+ *
+ * Some EC registers (e.g. the direct fan speed registers at 0x1804/0x1809)
+ * are not accessible through the ACPI ECRW method but can be reached
+ * through this WMI interface.
+ */
+int uniwill_wmi_ec_write(u16 addr, u8 data)
+{
+	u8 buf[40] = {};
+	struct acpi_buffer input = { sizeof(buf), buf };
+	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *obj;
+	acpi_status status;
+
+	buf[0] = addr & 0xff;
+	buf[1] = (addr >> 8) & 0xff;
+	buf[2] = data;
+	/* buf[3] = 0 (data_high) */
+	/* buf[5] = 0 (function: 0 = write) */
+
+	status = wmi_evaluate_method(UNIWILL_WMI_MGMT_GUID_BC, 0, 0x04,
+				     &input, &output);
+	obj = output.pointer;
+
+	if (obj && obj->type == ACPI_TYPE_BUFFER && obj->buffer.length >= 4) {
+		u32 result;
+
+		memcpy(&result, obj->buffer.pointer, sizeof(result));
+		if (result == 0xfefefefe) {
+			kfree(obj);
+			return -EIO;
+		}
+	}
+
+	kfree(obj);
+
+	if (ACPI_FAILURE(status))
+		return -EIO;
+
+	return 0;
+}
+
 static void uniwill_wmi_notify(struct wmi_device *wdev, union acpi_object *obj)
 {
 	u32 value;

@@ -132,6 +132,8 @@ int devm_uniwill_wmi_register_notifier(struct device *dev, struct notifier_block
 
 int uniwill_wmi_evaluate(u8 function, u32 arg);
 
+int uniwill_wmi_ec_write(u16 addr, u8 data);
+
 int __init uniwill_wmi_register_driver(void);
 
 void __exit uniwill_wmi_unregister_driver(void);
