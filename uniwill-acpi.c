@@ -430,6 +430,7 @@ struct uniwill_data {
 	bool boost_active;		/* True when EC is in boost (FAN_MODE_BOOST) mode */
 	bool has_mini_led_dimming;
 	bool mini_led_dimming_state;
+	bool dynamic_boost_enable;
 };
 
 struct uniwill_battery_entry {
@@ -992,6 +993,43 @@ static ssize_t ctgp_offset_show(struct device *dev, struct device_attribute *att
 
 static DEVICE_ATTR_RW(ctgp_offset);
 
+static ssize_t dynamic_boost_enable_store(struct device *dev, struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_update_bits(data->regmap, EC_ADDR_CTGP_DB_CTRL,
+				 CTGP_DB_DB_ENABLE, enable ? CTGP_DB_DB_ENABLE : 0);
+	if (ret < 0)
+		return ret;
+
+	data->dynamic_boost_enable = enable;
+
+	return count;
+}
+
+static ssize_t dynamic_boost_enable_show(struct device *dev, struct device_attribute *attr,
+					 char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_CTGP_DB_CTRL, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", !!(value & CTGP_DB_DB_ENABLE));
+}
+
+static DEVICE_ATTR_RW(dynamic_boost_enable);
+
 static int uniwill_nvidia_ctgp_init(struct uniwill_data *data)
 {
 	int ret;
@@ -1015,6 +1053,8 @@ static int uniwill_nvidia_ctgp_init(struct uniwill_data *data)
 			      CTGP_DB_GENERAL_ENABLE | CTGP_DB_DB_ENABLE | CTGP_DB_CTGP_ENABLE);
 	if (ret < 0)
 		return ret;
+
+	data->dynamic_boost_enable = true;
 
 	return 0;
 }
@@ -1246,6 +1286,7 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_breathing_in_suspend.attr,
 	/* Power-management-related */
 	&dev_attr_ctgp_offset.attr,
+	&dev_attr_dynamic_boost_enable.attr,
 	&dev_attr_usb_c_power_priority.attr,
 	&dev_attr_ac_auto_boot.attr,
 	&dev_attr_usb_powershare_high.attr,
@@ -1281,6 +1322,11 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 	}
 
 	if (attr == &dev_attr_ctgp_offset.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_dynamic_boost_enable.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
 			return attr->mode;
 	}
@@ -3305,8 +3351,10 @@ static int uniwill_resume_nvidia_ctgp(struct uniwill_data *data)
 	if (!uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
 		return 0;
 
-	return regmap_set_bits(data->regmap, EC_ADDR_CTGP_DB_CTRL,
-			       CTGP_DB_DB_ENABLE | CTGP_DB_CTGP_ENABLE);
+	return regmap_update_bits(data->regmap, EC_ADDR_CTGP_DB_CTRL,
+				  CTGP_DB_DB_ENABLE | CTGP_DB_CTGP_ENABLE,
+				  (data->dynamic_boost_enable ? CTGP_DB_DB_ENABLE : 0) |
+				  CTGP_DB_CTGP_ENABLE);
 }
 
 static int uniwill_resume_usb_c_power_priority(struct uniwill_data *data)
