@@ -1587,10 +1587,6 @@ static int uniwill_fan_enable_custom_tables(struct uniwill_data *data)
 {
 	int ret;
 
-	ret = uniwill_fan_init_tables(data);
-	if (ret < 0)
-		return ret;
-
 	/* Enable split tables so CPU and GPU fans use separate curves */
 	ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
 			      SPLIT_TABLES);
@@ -1732,6 +1728,296 @@ static int uniwill_write(struct device *dev, enum hwmon_sensor_types type, u32 a
 	}
 }
 
+static const unsigned int fan_speed_table_base[2] = {
+	EC_ADDR_CPU_FAN_SPEED_TABLE,
+	EC_ADDR_GPU_FAN_SPEED_TABLE,
+};
+
+static const unsigned int fan_temp_end_table_base[2] = {
+	EC_ADDR_CPU_TEMP_END_TABLE,
+	EC_ADDR_GPU_TEMP_END_TABLE,
+};
+
+static const unsigned int fan_temp_start_table_base[2] = {
+	EC_ADDR_CPU_TEMP_START_TABLE,
+	EC_ADDR_GPU_TEMP_START_TABLE,
+};
+
+/*
+ * Fan curve auto_point attributes.
+ *
+ * Each of the FAN_TABLE_LENGTH zones is described by three attributes:
+ *   pwmN_auto_pointM_pwm       - target fan speed at this zone (0-255 hwmon
+ *                                scale)
+ *   pwmN_auto_pointM_temp      - upper temperature threshold (millidegrees
+ *                                Celsius)
+ *   pwmN_auto_pointM_temp_hyst - lower temperature threshold (millidegrees
+ *                                Celsius)
+ *
+ * attr->nr encodes the fan channel (0 = primary, 1 = secondary).
+ * attr->index encodes the zone index (0 .. FAN_TABLE_LENGTH - 1).
+ */
+static ssize_t uniwill_auto_point_pwm_show(struct device *dev,
+					   struct device_attribute *devattr,
+					   char *buf)
+{
+	struct sensor_device_attribute_2 *attr = to_sensor_dev_attr_2(devattr);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(data->regmap,
+			  fan_speed_table_base[attr->nr] + attr->index,
+			  &val);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n",
+			  fixp_linear_interpolate(0, 0, PWM_MAX, U8_MAX, val));
+}
+
+static ssize_t uniwill_auto_point_pwm_store(struct device *dev,
+					    struct device_attribute *devattr,
+					    const char *buf, size_t count)
+{
+	struct sensor_device_attribute_2 *attr = to_sensor_dev_attr_2(devattr);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned long val;
+	int ret;
+
+	ret = kstrtoul(buf, 10, &val);
+	if (ret < 0)
+		return ret;
+
+	if (val > U8_MAX)
+		return -EINVAL;
+
+	ret = regmap_write(data->regmap,
+			   fan_speed_table_base[attr->nr] + attr->index,
+			   fixp_linear_interpolate(0, 0, U8_MAX, PWM_MAX, val));
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static ssize_t uniwill_auto_point_temp_show(struct device *dev,
+					    struct device_attribute *devattr,
+					    char *buf)
+{
+	struct sensor_device_attribute_2 *attr = to_sensor_dev_attr_2(devattr);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(data->regmap,
+			  fan_temp_end_table_base[attr->nr] + attr->index,
+			  &val);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", val * MILLIDEGREE_PER_DEGREE);
+}
+
+static ssize_t uniwill_auto_point_temp_store(struct device *dev,
+					     struct device_attribute *devattr,
+					     const char *buf, size_t count)
+{
+	struct sensor_device_attribute_2 *attr = to_sensor_dev_attr_2(devattr);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned long val;
+	int ret;
+
+	ret = kstrtoul(buf, 10, &val);
+	if (ret < 0)
+		return ret;
+
+	val = DIV_ROUND_CLOSEST(val, MILLIDEGREE_PER_DEGREE);
+	if (val > U8_MAX)
+		return -EINVAL;
+
+	ret = regmap_write(data->regmap,
+			   fan_temp_end_table_base[attr->nr] + attr->index,
+			   val);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static ssize_t uniwill_auto_point_temp_hyst_show(struct device *dev,
+						 struct device_attribute *devattr,
+						 char *buf)
+{
+	struct sensor_device_attribute_2 *attr = to_sensor_dev_attr_2(devattr);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(data->regmap,
+			  fan_temp_start_table_base[attr->nr] + attr->index,
+			  &val);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", val * MILLIDEGREE_PER_DEGREE);
+}
+
+static ssize_t uniwill_auto_point_temp_hyst_store(struct device *dev,
+						  struct device_attribute *devattr,
+						  const char *buf, size_t count)
+{
+	struct sensor_device_attribute_2 *attr = to_sensor_dev_attr_2(devattr);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned long val;
+	int ret;
+
+	ret = kstrtoul(buf, 10, &val);
+	if (ret < 0)
+		return ret;
+
+	val = DIV_ROUND_CLOSEST(val, MILLIDEGREE_PER_DEGREE);
+	if (val > U8_MAX)
+		return -EINVAL;
+
+	ret = regmap_write(data->regmap,
+			   fan_temp_start_table_base[attr->nr] + attr->index,
+			   val);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+/*
+ * Macro generating the three SENSOR_DEVICE_ATTR_2 declarations for one
+ * (fan, zone) pair.  _fn is 1-based (matches the sysfs "pwmN" index),
+ * _zn is 1-based (matches the sysfs "auto_pointM" index).
+ */
+#define UNIWILL_AUTO_POINT_ATTRS(_fn, _zn)					\
+static SENSOR_DEVICE_ATTR_2_RW(pwm##_fn##_auto_point##_zn##_pwm,		\
+			       uniwill_auto_point_pwm, (_fn) - 1, (_zn) - 1);	\
+static SENSOR_DEVICE_ATTR_2_RW(pwm##_fn##_auto_point##_zn##_temp,		\
+			       uniwill_auto_point_temp, (_fn) - 1, (_zn) - 1);	\
+static SENSOR_DEVICE_ATTR_2_RW(pwm##_fn##_auto_point##_zn##_temp_hyst,		\
+			       uniwill_auto_point_temp_hyst, (_fn) - 1, (_zn) - 1)
+
+/* Primary fan (pwm1) zones */
+UNIWILL_AUTO_POINT_ATTRS(1,  1);
+UNIWILL_AUTO_POINT_ATTRS(1,  2);
+UNIWILL_AUTO_POINT_ATTRS(1,  3);
+UNIWILL_AUTO_POINT_ATTRS(1,  4);
+UNIWILL_AUTO_POINT_ATTRS(1,  5);
+UNIWILL_AUTO_POINT_ATTRS(1,  6);
+UNIWILL_AUTO_POINT_ATTRS(1,  7);
+UNIWILL_AUTO_POINT_ATTRS(1,  8);
+UNIWILL_AUTO_POINT_ATTRS(1,  9);
+UNIWILL_AUTO_POINT_ATTRS(1, 10);
+UNIWILL_AUTO_POINT_ATTRS(1, 11);
+UNIWILL_AUTO_POINT_ATTRS(1, 12);
+UNIWILL_AUTO_POINT_ATTRS(1, 13);
+UNIWILL_AUTO_POINT_ATTRS(1, 14);
+UNIWILL_AUTO_POINT_ATTRS(1, 15);
+UNIWILL_AUTO_POINT_ATTRS(1, 16);
+
+/* Secondary fan (pwm2) zones */
+UNIWILL_AUTO_POINT_ATTRS(2,  1);
+UNIWILL_AUTO_POINT_ATTRS(2,  2);
+UNIWILL_AUTO_POINT_ATTRS(2,  3);
+UNIWILL_AUTO_POINT_ATTRS(2,  4);
+UNIWILL_AUTO_POINT_ATTRS(2,  5);
+UNIWILL_AUTO_POINT_ATTRS(2,  6);
+UNIWILL_AUTO_POINT_ATTRS(2,  7);
+UNIWILL_AUTO_POINT_ATTRS(2,  8);
+UNIWILL_AUTO_POINT_ATTRS(2,  9);
+UNIWILL_AUTO_POINT_ATTRS(2, 10);
+UNIWILL_AUTO_POINT_ATTRS(2, 11);
+UNIWILL_AUTO_POINT_ATTRS(2, 12);
+UNIWILL_AUTO_POINT_ATTRS(2, 13);
+UNIWILL_AUTO_POINT_ATTRS(2, 14);
+UNIWILL_AUTO_POINT_ATTRS(2, 15);
+UNIWILL_AUTO_POINT_ATTRS(2, 16);
+
+#define UNIWILL_AUTO_POINT_ATTRS_REF(_fn, _zn)					\
+	&sensor_dev_attr_pwm##_fn##_auto_point##_zn##_pwm.dev_attr.attr,	\
+	&sensor_dev_attr_pwm##_fn##_auto_point##_zn##_temp.dev_attr.attr,	\
+	&sensor_dev_attr_pwm##_fn##_auto_point##_zn##_temp_hyst.dev_attr.attr
+
+static struct attribute *uniwill_auto_point_attrs[] = {
+	UNIWILL_AUTO_POINT_ATTRS_REF(1,  1),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1,  2),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1,  3),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1,  4),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1,  5),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1,  6),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1,  7),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1,  8),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1,  9),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1, 10),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1, 11),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1, 12),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1, 13),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1, 14),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1, 15),
+	UNIWILL_AUTO_POINT_ATTRS_REF(1, 16),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2,  1),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2,  2),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2,  3),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2,  4),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2,  5),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2,  6),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2,  7),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2,  8),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2,  9),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2, 10),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2, 11),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2, 12),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2, 13),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2, 14),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2, 15),
+	UNIWILL_AUTO_POINT_ATTRS_REF(2, 16),
+	NULL
+};
+
+static umode_t uniwill_auto_point_is_visible(struct kobject *kobj,
+					     struct attribute *attr, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	const struct sensor_device_attribute_2 *sda =
+		container_of(attr, struct sensor_device_attribute_2, dev_attr.attr);
+	unsigned int fan_feature;
+
+	if (!data->has_universal_fan_ctrl)
+		return 0;
+
+	switch (sda->nr) {
+	case 0:
+		fan_feature = UNIWILL_FEATURE_PRIMARY_FAN;
+		break;
+	case 1:
+		fan_feature = UNIWILL_FEATURE_SECONDARY_FAN;
+		break;
+	default:
+		return 0;
+	}
+
+	if (uniwill_device_supports(data, fan_feature))
+		return attr->mode;
+
+	return 0;
+}
+
+static const struct attribute_group uniwill_auto_point_group = {
+	.is_visible = uniwill_auto_point_is_visible,
+	.attrs	    = uniwill_auto_point_attrs,
+};
+
+static const struct attribute_group *uniwill_auto_point_groups[] = {
+	&uniwill_auto_point_group,
+	NULL,
+};
+
 static const struct hwmon_ops uniwill_ops = {
 	.is_visible = uniwill_is_visible,
 	.read = uniwill_read,
@@ -1769,7 +2055,8 @@ static int uniwill_hwmon_init(struct uniwill_data *data)
 		return 0;
 
 	hdev = devm_hwmon_device_register_with_info(data->dev, "uniwill", data,
-						    &uniwill_chip_info, NULL);
+						    &uniwill_chip_info,
+						    uniwill_auto_point_groups);
 
 	return PTR_ERR_OR_ZERO(hdev);
 }
@@ -2714,6 +3001,19 @@ static int uniwill_probe(struct platform_device *pdev)
 	/* Auto-detect universal fan control support */
 	data->has_universal_fan_ctrl = uniwill_has_universal_fan_ctrl(data);
 	data->fan_mode = 2;
+
+	/*
+	 * Initialise the fan curve tables with sensible defaults so that
+	 * manual mode can be enabled without prior auto_point programming.
+	 * Zone 0 is set to the current fan speed to avoid a sudden change
+	 * on the first mode 1 entry; zones 1-15 are populated with dummy
+	 * safety entries well beyond the normal operating temperature range.
+	 */
+	if (data->has_universal_fan_ctrl) {
+		ret = uniwill_fan_init_tables(data);
+		if (ret < 0)
+			return ret;
+	}
 
 	/*
 	 * Some devices might need to perform some device-specific initialization steps
