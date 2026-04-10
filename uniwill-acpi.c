@@ -144,6 +144,9 @@
 #define PROJECT_ID_PHXAXXX		0x17
 #define PROJECT_ID_PHXPXXX		0x18
 
+#define EC_ADDR_CUSTOM_PROFILE		0x0727
+#define CUSTOM_PROFILE_MODE		BIT(6)
+
 #define EC_ADDR_AP_OEM			0x0741
 #define	ENABLE_MANUAL_CTRL		BIT(0)
 #define ITE_KBD_EFFECT_REACTIVE		BIT(3)
@@ -420,6 +423,7 @@ struct uniwill_data {
 	enum usb_c_power_priority_options last_usb_c_power_priority_option;
 	unsigned int num_profiles;
 	unsigned int last_fan_ctrl;
+	bool custom_profile_mode_needed;
 	bool has_mini_led_dimming;
 	bool mini_led_dimming_state;
 };
@@ -434,6 +438,7 @@ struct uniwill_device_descriptor {
 	unsigned int kbd_led_max_brightness;
 	unsigned int lightbar_max_brightness;
 	unsigned int num_profiles;
+	bool custom_profile_mode_needed;
 	/* Executed during driver probing */
 	int (*probe)(struct uniwill_data *data);
 };
@@ -612,6 +617,7 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_LIGHTBAR_BAT_RED:
 	case EC_ADDR_LIGHTBAR_BAT_GREEN:
 	case EC_ADDR_LIGHTBAR_BAT_BLUE:
+	case EC_ADDR_CUSTOM_PROFILE:
 	case EC_ADDR_CTGP_DB_CTRL:
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
@@ -659,6 +665,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_LIGHTBAR_BAT_GREEN:
 	case EC_ADDR_LIGHTBAR_BAT_BLUE:
 	case EC_ADDR_SYSTEM_ID:
+	case EC_ADDR_CUSTOM_PROFILE:
 	case EC_ADDR_CTGP_DB_CTRL:
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
@@ -689,6 +696,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_TRIGGER:
 	case EC_ADDR_SWITCH_STATUS:
 	case EC_ADDR_KBD_STATUS:
+	case EC_ADDR_CUSTOM_PROFILE:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
@@ -1568,6 +1576,30 @@ static int uniwill_profile_init(struct uniwill_data *data)
 	return PTR_ERR_OR_ZERO(pprof);
 }
 
+static int uniwill_custom_profile_init(struct uniwill_data *data)
+{
+	int ret;
+
+	if (!data->custom_profile_mode_needed)
+		return 0;
+
+	/*
+	 * Some devices require EC register 0x0727 bit 6 (custom profile mode)
+	 * to be set for TDP and fan control to work properly. The bit is first
+	 * cleared and then set  after a short delay, since certain devices need
+	 * this sequence for reliable activation.
+	 */
+	ret = regmap_clear_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
+				CUSTOM_PROFILE_MODE);
+	if (ret < 0)
+		return ret;
+
+	msleep(50);
+
+	return regmap_set_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
+			       CUSTOM_PROFILE_MODE);
+}
+
 static const unsigned int uniwill_led_channel_to_bat_reg[LED_CHANNELS] = {
 	EC_ADDR_LIGHTBAR_BAT_RED,
 	EC_ADDR_LIGHTBAR_BAT_GREEN,
@@ -2199,10 +2231,18 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 
 		return NOTIFY_OK;
 	case UNIWILL_OSD_DC_ADAPTER_CHANGED:
-		if (!uniwill_device_supports(data, UNIWILL_FEATURE_USB_C_POWER_PRIORITY))
-			return NOTIFY_DONE;
+		/*
+		 * Re-apply custom profile mode on AC adapter change. Some
+		 * devices lose this setting when the power source changes.
+		 */
+		if (data->custom_profile_mode_needed)
+			regmap_set_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
+					CUSTOM_PROFILE_MODE);
 
-		return notifier_from_errno(usb_c_power_priority_restore(data));
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_USB_C_POWER_PRIORITY))
+			return notifier_from_errno(usb_c_power_priority_restore(data));
+
+		return NOTIFY_OK;
 	case UNIWILL_OSD_FN_LOCK:
 		if (!uniwill_device_supports(data, UNIWILL_FEATURE_FN_LOCK))
 			return NOTIFY_DONE;
@@ -2339,6 +2379,7 @@ static int uniwill_probe(struct platform_device *pdev)
 	data->kbd_led_max_brightness = device_descriptor.kbd_led_max_brightness;
 	data->lightbar_max_brightness = device_descriptor.lightbar_max_brightness;
 	data->num_profiles = device_descriptor.num_profiles;
+	data->custom_profile_mode_needed = device_descriptor.custom_profile_mode_needed;
 
 	/* Auto-detect mini LED local dimming support */
 	data->has_mini_led_dimming = uniwill_has_mini_led_dimming(data);
@@ -2375,6 +2416,10 @@ static int uniwill_probe(struct platform_device *pdev)
 		return ret;
 
 	ret = uniwill_profile_init(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_custom_profile_init(data);
 	if (ret < 0)
 		return ret;
 
@@ -2488,6 +2533,19 @@ static int uniwill_suspend_profile(struct uniwill_data *data)
 	return regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &data->last_fan_ctrl);
 }
 
+static int uniwill_suspend_custom_profile(struct uniwill_data *data)
+{
+	if (!data->custom_profile_mode_needed)
+		return 0;
+
+	/*
+	 * Clear custom profile mode before suspend to prevent at least one
+	 * known device from immediately waking up after entering suspend.
+	 */
+	return regmap_clear_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
+				CUSTOM_PROFILE_MODE);
+}
+
 static int uniwill_suspend(struct device *dev)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2518,6 +2576,10 @@ static int uniwill_suspend(struct device *dev)
 		return ret;
 
 	ret = uniwill_suspend_profile(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_suspend_custom_profile(data);
 	if (ret < 0)
 		return ret;
 
@@ -2616,6 +2678,15 @@ static int uniwill_resume_profile(struct uniwill_data *data)
 				  PROFILE_MODE_MASK, data->last_fan_ctrl);
 }
 
+static int uniwill_resume_custom_profile(struct uniwill_data *data)
+{
+	if (!data->custom_profile_mode_needed)
+		return 0;
+
+	return regmap_set_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
+			       CUSTOM_PROFILE_MODE);
+}
+
 static int uniwill_resume_mini_led(struct uniwill_data *data)
 {
 	if (!data->has_mini_led_dimming)
@@ -2669,6 +2740,10 @@ static int uniwill_resume(struct device *dev)
 		return ret;
 
 	ret = uniwill_resume_profile(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_resume_custom_profile(data);
 	if (ret < 0)
 		return ret;
 
@@ -2838,6 +2913,31 @@ static struct uniwill_device_descriptor tux_featureset_3_nvidia_descriptor __ini
 		    UNIWILL_FEATURE_PRIMARY_FAN |
 		    UNIWILL_FEATURE_SECONDARY_FAN |
 		    UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL,
+};
+
+static struct uniwill_device_descriptor tux_featureset_3_cpm_descriptor __initdata = {
+	.features = UNIWILL_FEATURE_FN_LOCK |
+		    UNIWILL_FEATURE_SUPER_KEY |
+		    UNIWILL_FEATURE_CPU_TEMP |
+		    UNIWILL_FEATURE_PRIMARY_FAN |
+		    UNIWILL_FEATURE_SECONDARY_FAN |
+		    UNIWILL_FEATURE_KEYBOARD_BACKLIGHT |
+		    UNIWILL_FEATURE_AC_AUTO_BOOT |
+		    UNIWILL_FEATURE_USB_POWERSHARE,
+	.kbd_led_max_brightness = 4,
+	.num_profiles = 3,
+	.custom_profile_mode_needed = true,
+};
+
+static struct uniwill_device_descriptor tux_featureset_3_nvidia_cpm_descriptor __initdata = {
+	.features = UNIWILL_FEATURE_FN_LOCK |
+		    UNIWILL_FEATURE_SUPER_KEY |
+		    UNIWILL_FEATURE_CPU_TEMP |
+		    UNIWILL_FEATURE_GPU_TEMP |
+		    UNIWILL_FEATURE_PRIMARY_FAN |
+		    UNIWILL_FEATURE_SECONDARY_FAN |
+		    UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL,
+	.custom_profile_mode_needed = true,
 };
 
 static int phxtxx1_probe(struct uniwill_data *data)
@@ -3038,7 +3138,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GXxHRXx"),
 		},
-		.driver_data = &tux_featureset_3_descriptor,
+		.driver_data = &tux_featureset_3_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Pro 14/15 Gen9 Intel/Commodore Omnia-Book 15 Gen9",
@@ -3046,7 +3146,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GXxMRXx"),
 		},
-		.driver_data = &tux_featureset_3_descriptor,
+		.driver_data = &tux_featureset_3_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Pro 14/15 Gen10 AMD",
@@ -3054,7 +3154,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "XxHP4NAx"),
 		},
-		.driver_data = &tux_featureset_3_descriptor,
+		.driver_data = &tux_featureset_3_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Pro 14/15 Gen10 AMD",
@@ -3062,7 +3162,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "XxKK4NAx_XxSP4NAx"),
 		},
-		.driver_data = &tux_featureset_3_descriptor,
+		.driver_data = &tux_featureset_3_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Pro 15 Gen10 Intel",
@@ -3078,7 +3178,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X5KK45xS_X5SP45xS"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Max 16 Gen10 AMD",
@@ -3094,7 +3194,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6KK45xU_X6SP45xU"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Max 15 Gen10 Intel",
@@ -3102,7 +3202,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X5AR45xS"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Max 16 Gen10 Intel",
@@ -3110,7 +3210,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6AR55xU"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 15 Gen1 AMD",
@@ -3270,7 +3370,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GMxHGxx"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris Slim 15 Gen6 Intel/Commodore ORION Slim 15 Gen6",
@@ -3278,7 +3378,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GM5IXxA"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen6 Intel/Commodore ORION 16 Gen6",
@@ -3286,7 +3386,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GM6IXxB_MB1"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen6 Intel/Commodore ORION 16 Gen6",
@@ -3294,7 +3394,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GM6IXxB_MB2"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 17 Gen6 Intel/Commodore ORION 17 Gen6",
@@ -3302,7 +3402,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GM7IXxN"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen7 AMD",
@@ -3310,7 +3410,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6FR5xxY"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen7 Intel",
@@ -3318,7 +3418,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6AR5xxY"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen7 Intel",
@@ -3326,7 +3426,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6AR5xxY_mLED"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
 		.ident = "TUXEDO Book BA15 Gen10 AMD",
@@ -3401,6 +3501,8 @@ static int __init uniwill_init(void)
 		device_descriptor.lightbar_max_brightness = 200;
 		/* Assume three performance profiles */
 		device_descriptor.num_profiles = 3;
+		/* Some devices need custom profile mode for TDP control */
+		device_descriptor.custom_profile_mode_needed = true;
 		pr_warn("Enabling potentially unsupported features\n");
 	}
 
