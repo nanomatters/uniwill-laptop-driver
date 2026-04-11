@@ -39,6 +39,7 @@
 #include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/platform_device.h>
+#include <linux/platform_profile.h>
 #include <linux/pm.h>
 #include <linux/printk.h>
 #include <linux/regmap.h>
@@ -46,6 +47,7 @@
 #include <linux/sysfs.h>
 #include <linux/types.h>
 #include <linux/units.h>
+#include <linux/wmi.h>
 
 #include <acpi/battery.h>
 
@@ -185,6 +187,11 @@
 #define FAN_MODE_BOOST			BIT(6)
 #define FAN_MODE_USER			BIT(7)
 
+#define PROFILE_MODE_MASK		(FAN_MODE_USER | FAN_MODE_HIGH | FAN_MODE_TURBO)
+#define PROFILE_QUIET			(FAN_MODE_USER | FAN_MODE_HIGH)
+#define PROFILE_BALANCED		0
+#define PROFILE_PERFORMANCE		FAN_MODE_TURBO
+
 #define EC_ADDR_PWM_1			0x075B
 
 #define EC_ADDR_PWM_2			0x075C
@@ -314,6 +321,8 @@
 
 #define EC_ADDR_LIGHTBAR_BAT_BLUE	0x07E5
 
+#define EC_ADDR_MINI_LED_SUPPORT	0x0D4F
+
 #define EC_ADDR_CPU_TEMP_END_TABLE	0x0F00
 
 #define EC_ADDR_CPU_TEMP_START_TABLE	0x0F10
@@ -409,6 +418,10 @@ struct uniwill_data {
 	struct notifier_block nb;
 	struct mutex usb_c_power_priority_lock; /* Protects dependent bit write and state safe */
 	enum usb_c_power_priority_options last_usb_c_power_priority_option;
+	unsigned int num_profiles;
+	unsigned int last_fan_ctrl;
+	bool has_mini_led_dimming;
+	bool mini_led_dimming_state;
 };
 
 struct uniwill_battery_entry {
@@ -420,6 +433,7 @@ struct uniwill_device_descriptor {
 	unsigned int features;
 	unsigned int kbd_led_max_brightness;
 	unsigned int lightbar_max_brightness;
+	unsigned int num_profiles;
 	/* Executed during driver probing */
 	int (*probe)(struct uniwill_data *data);
 };
@@ -602,6 +616,7 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
 	case EC_ADDR_CTGP_DB_DB_OFFSET:
+	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 		return true;
 	default:
@@ -648,6 +663,8 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
 	case EC_ADDR_CTGP_DB_DB_OFFSET:
+	case EC_ADDR_MANUAL_FAN_CTRL:
+	case EC_ADDR_MINI_LED_SUPPORT:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 		return true;
 	default:
@@ -672,6 +689,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_TRIGGER:
 	case EC_ADDR_SWITCH_STATUS:
 	case EC_ADDR_KBD_STATUS:
+	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 		return true;
@@ -1151,6 +1169,42 @@ static ssize_t usb_powershare_high_show(struct device *dev, struct device_attrib
 
 static DEVICE_ATTR_RW(usb_powershare_high);
 
+static ssize_t mini_led_local_dimming_store(struct device *dev, struct device_attribute *attr,
+					    const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	if (enable)
+		ret = uniwill_wmi_evaluate(UNIWILL_WMI_FUNC_FEATURE_TOGGLE,
+					   UNIWILL_WMI_LOCAL_DIMMING_ON);
+	else
+		ret = uniwill_wmi_evaluate(UNIWILL_WMI_FUNC_FEATURE_TOGGLE,
+					   UNIWILL_WMI_LOCAL_DIMMING_OFF);
+
+	if (ret < 0)
+		return ret;
+
+	data->mini_led_dimming_state = enable;
+
+	return count;
+}
+
+static ssize_t mini_led_local_dimming_show(struct device *dev, struct device_attribute *attr,
+					   char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", data->mini_led_dimming_state);
+}
+
+static DEVICE_ATTR_RW(mini_led_local_dimming);
+
 static struct attribute *uniwill_attrs[] = {
 	/* Keyboard-related */
 	&dev_attr_fn_lock.attr,
@@ -1164,6 +1218,8 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_usb_c_power_priority.attr,
 	&dev_attr_ac_auto_boot.attr,
 	&dev_attr_usb_powershare_high.attr,
+	/* Display-related */
+	&dev_attr_mini_led_local_dimming.attr,
 	NULL
 };
 
@@ -1210,6 +1266,11 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 
 	if (attr == &dev_attr_usb_powershare_high.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_USB_POWERSHARE))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_mini_led_local_dimming.attr) {
+		if (data->has_mini_led_dimming)
 			return attr->mode;
 	}
 
@@ -1389,6 +1450,122 @@ static int uniwill_hwmon_init(struct uniwill_data *data)
 						    &uniwill_chip_info, NULL);
 
 	return PTR_ERR_OR_ZERO(hdev);
+}
+
+static bool uniwill_has_mini_led_dimming(struct uniwill_data *data)
+{
+	unsigned int value;
+
+	if (!wmi_has_guid(UNIWILL_WMI_MGMT_GUID_BC))
+		return false;
+
+	if (regmap_read(data->regmap, EC_ADDR_MINI_LED_SUPPORT, &value) < 0)
+		return false;
+
+	return value != 0xFF && (value & BIT(0));
+}
+
+static int uniwill_mini_led_init(struct uniwill_data *data)
+{
+	int ret;
+
+	if (!data->has_mini_led_dimming)
+		return 0;
+
+	/* Set default to off */
+	ret = uniwill_wmi_evaluate(UNIWILL_WMI_FUNC_FEATURE_TOGGLE,
+				   UNIWILL_WMI_LOCAL_DIMMING_OFF);
+	if (ret < 0)
+		return ret;
+
+	data->mini_led_dimming_state = false;
+
+	return 0;
+}
+
+static int uniwill_profile_probe(void *drvdata, unsigned long *choices)
+{
+	struct uniwill_data *data = drvdata;
+
+	set_bit(PLATFORM_PROFILE_QUIET, choices);
+	set_bit(PLATFORM_PROFILE_BALANCED, choices);
+
+	if (data->num_profiles >= 3)
+		set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
+
+	return 0;
+}
+
+static int uniwill_profile_get(struct device *dev, enum platform_profile_option *profile)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &value);
+	if (ret < 0)
+		return ret;
+
+	switch (value & PROFILE_MODE_MASK) {
+	case PROFILE_QUIET:
+		*profile = PLATFORM_PROFILE_QUIET;
+		return 0;
+	case PROFILE_PERFORMANCE:
+		*profile = PLATFORM_PROFILE_PERFORMANCE;
+		return 0;
+	default:
+		*profile = PLATFORM_PROFILE_BALANCED;
+		return 0;
+	}
+}
+
+static int uniwill_profile_set(struct device *dev, enum platform_profile_option profile)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+
+	switch (profile) {
+	case PLATFORM_PROFILE_QUIET:
+		value = PROFILE_QUIET;
+		break;
+	case PLATFORM_PROFILE_BALANCED:
+		value = PROFILE_BALANCED;
+		break;
+	case PLATFORM_PROFILE_PERFORMANCE:
+		value = PROFILE_PERFORMANCE;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+				  PROFILE_MODE_MASK, value);
+}
+
+static const struct platform_profile_ops uniwill_profile_ops = {
+	.probe = uniwill_profile_probe,
+	.profile_get = uniwill_profile_get,
+	.profile_set = uniwill_profile_set,
+};
+
+static int uniwill_profile_init(struct uniwill_data *data)
+{
+	struct device *pprof;
+
+	if (data->num_profiles == 0)
+		return 0;
+
+	/*
+	 * Initialize to balanced mode. This matches the tuxedo driver behavior
+	 * which resets EC_ADDR_MANUAL_FAN_CTRL to 0x00 during probe.
+	 */
+	regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+			   PROFILE_MODE_MASK, PROFILE_BALANCED);
+
+	pprof = devm_platform_profile_register(data->dev, "uniwill-platform-profile",
+					       data, &uniwill_profile_ops);
+
+	return PTR_ERR_OR_ZERO(pprof);
 }
 
 static const unsigned int uniwill_led_channel_to_bat_reg[LED_CHANNELS] = {
@@ -2161,6 +2338,10 @@ static int uniwill_probe(struct platform_device *pdev)
 	data->features = device_descriptor.features;
 	data->kbd_led_max_brightness = device_descriptor.kbd_led_max_brightness;
 	data->lightbar_max_brightness = device_descriptor.lightbar_max_brightness;
+	data->num_profiles = device_descriptor.num_profiles;
+
+	/* Auto-detect mini LED local dimming support */
+	data->has_mini_led_dimming = uniwill_has_mini_led_dimming(data);
 
 	/*
 	 * Some devices might need to perform some device-specific initialization steps
@@ -2190,6 +2371,14 @@ static int uniwill_probe(struct platform_device *pdev)
 		return ret;
 
 	ret = uniwill_nvidia_ctgp_init(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_profile_init(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_mini_led_init(data);
 	if (ret < 0)
 		return ret;
 
@@ -2287,6 +2476,18 @@ static int uniwill_suspend_nvidia_ctgp(struct uniwill_data *data)
 				 CTGP_DB_DB_ENABLE | CTGP_DB_CTGP_ENABLE);
 }
 
+static int uniwill_suspend_profile(struct uniwill_data *data)
+{
+	if (data->num_profiles == 0)
+		return 0;
+
+	/*
+	 * Save the current fan control mode to restore it during resume.
+	 * This register is volatile since the EC can change it.
+	 */
+	return regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &data->last_fan_ctrl);
+}
+
 static int uniwill_suspend(struct device *dev)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2313,6 +2514,10 @@ static int uniwill_suspend(struct device *dev)
 		return ret;
 
 	ret = uniwill_suspend_nvidia_ctgp(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_suspend_profile(data);
 	if (ret < 0)
 		return ret;
 
@@ -2402,6 +2607,28 @@ static int uniwill_resume_usb_c_power_priority(struct uniwill_data *data)
 	return usb_c_power_priority_restore(data);
 }
 
+static int uniwill_resume_profile(struct uniwill_data *data)
+{
+	if (data->num_profiles == 0)
+		return 0;
+
+	return regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+				  PROFILE_MODE_MASK, data->last_fan_ctrl);
+}
+
+static int uniwill_resume_mini_led(struct uniwill_data *data)
+{
+	if (!data->has_mini_led_dimming)
+		return 0;
+
+	if (data->mini_led_dimming_state)
+		return uniwill_wmi_evaluate(UNIWILL_WMI_FUNC_FEATURE_TOGGLE,
+					    UNIWILL_WMI_LOCAL_DIMMING_ON);
+
+	return uniwill_wmi_evaluate(UNIWILL_WMI_FUNC_FEATURE_TOGGLE,
+				    UNIWILL_WMI_LOCAL_DIMMING_OFF);
+}
+
 static int uniwill_resume(struct device *dev)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2437,7 +2664,15 @@ static int uniwill_resume(struct device *dev)
 	if (ret < 0)
 		return ret;
 
-	return uniwill_resume_usb_c_power_priority(data);
+	ret = uniwill_resume_usb_c_power_priority(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_resume_profile(data);
+	if (ret < 0)
+		return ret;
+
+	return uniwill_resume_mini_led(data);
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(uniwill_pm_ops, uniwill_suspend, uniwill_resume);
@@ -2528,6 +2763,16 @@ static struct uniwill_device_descriptor tux_featureset_1_descriptor __initdata =
 		    UNIWILL_FEATURE_USB_C_POWER_PRIORITY,
 };
 
+static struct uniwill_device_descriptor pulse_gen1_descriptor __initdata = {
+	.features = UNIWILL_FEATURE_FN_LOCK |
+		    UNIWILL_FEATURE_SUPER_KEY |
+		    UNIWILL_FEATURE_CPU_TEMP |
+		    UNIWILL_FEATURE_PRIMARY_FAN |
+		    UNIWILL_FEATURE_SECONDARY_FAN |
+		    UNIWILL_FEATURE_USB_C_POWER_PRIORITY,
+	.num_profiles = 2,
+};
+
 static struct uniwill_device_descriptor tux_featureset_1_nvidia_descriptor __initdata = {
 	.features = UNIWILL_FEATURE_FN_LOCK |
 		    UNIWILL_FEATURE_SUPER_KEY |
@@ -2536,6 +2781,17 @@ static struct uniwill_device_descriptor tux_featureset_1_nvidia_descriptor __ini
 		    UNIWILL_FEATURE_PRIMARY_FAN |
 		    UNIWILL_FEATURE_SECONDARY_FAN |
 		    UNIWILL_FEATURE_USB_C_POWER_PRIORITY,
+};
+
+static struct uniwill_device_descriptor polaris_gen1_descriptor __initdata = {
+	.features = UNIWILL_FEATURE_FN_LOCK |
+		    UNIWILL_FEATURE_SUPER_KEY |
+		    UNIWILL_FEATURE_CPU_TEMP |
+		    UNIWILL_FEATURE_GPU_TEMP |
+		    UNIWILL_FEATURE_PRIMARY_FAN |
+		    UNIWILL_FEATURE_SECONDARY_FAN |
+		    UNIWILL_FEATURE_USB_C_POWER_PRIORITY,
+	.num_profiles = 3,
 };
 
 static struct uniwill_device_descriptor tux_featureset_2_nvidia_descriptor __initdata = {
@@ -2549,6 +2805,18 @@ static struct uniwill_device_descriptor tux_featureset_2_nvidia_descriptor __ini
 		    UNIWILL_FEATURE_USB_C_POWER_PRIORITY,
 };
 
+static struct uniwill_device_descriptor polaris_gen2_descriptor __initdata = {
+	.features = UNIWILL_FEATURE_FN_LOCK |
+		    UNIWILL_FEATURE_SUPER_KEY |
+		    UNIWILL_FEATURE_CPU_TEMP |
+		    UNIWILL_FEATURE_GPU_TEMP |
+		    UNIWILL_FEATURE_PRIMARY_FAN |
+		    UNIWILL_FEATURE_SECONDARY_FAN |
+		    UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL |
+		    UNIWILL_FEATURE_USB_C_POWER_PRIORITY,
+	.num_profiles = 3,
+};
+
 static struct uniwill_device_descriptor tux_featureset_3_descriptor __initdata = {
 	.features = UNIWILL_FEATURE_FN_LOCK |
 		    UNIWILL_FEATURE_SUPER_KEY |
@@ -2559,6 +2827,7 @@ static struct uniwill_device_descriptor tux_featureset_3_descriptor __initdata =
 		    UNIWILL_FEATURE_AC_AUTO_BOOT |
 		    UNIWILL_FEATURE_USB_POWERSHARE,
 	.kbd_led_max_brightness = 4,
+	.num_profiles = 3,
 };
 
 static struct uniwill_device_descriptor tux_featureset_3_nvidia_descriptor __initdata = {
@@ -2626,6 +2895,7 @@ static struct uniwill_device_descriptor pf5pu1g_descriptor __initdata = {
 		    UNIWILL_FEATURE_SUPER_KEY |
 		    UNIWILL_FEATURE_CPU_TEMP |
 		    UNIWILL_FEATURE_PRIMARY_FAN,
+	.num_profiles = 2,
 };
 
 static struct uniwill_device_descriptor x4sp4nal_descriptor __initdata = {
@@ -2848,7 +3118,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "POLARIS1501A1650TI"),
 		},
-		.driver_data = &tux_featureset_1_nvidia_descriptor,
+		.driver_data = &polaris_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 15 Gen1 AMD",
@@ -2856,7 +3126,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "POLARIS1501A2060"),
 		},
-		.driver_data = &tux_featureset_1_nvidia_descriptor,
+		.driver_data = &polaris_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 17 Gen1 AMD",
@@ -2864,7 +3134,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "POLARIS1701A1650TI"),
 		},
-		.driver_data = &tux_featureset_1_nvidia_descriptor,
+		.driver_data = &polaris_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 17 Gen1 AMD",
@@ -2872,7 +3142,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "POLARIS1701A2060"),
 		},
-		.driver_data = &tux_featureset_1_nvidia_descriptor,
+		.driver_data = &polaris_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 15 Gen1 Intel",
@@ -2880,7 +3150,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "POLARIS1501I1650TI"),
 		},
-		.driver_data = &tux_featureset_1_nvidia_descriptor,
+		.driver_data = &polaris_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 15 Gen1 Intel",
@@ -2888,7 +3158,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "POLARIS1501I2060"),
 		},
-		.driver_data = &tux_featureset_1_nvidia_descriptor,
+		.driver_data = &polaris_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 17 Gen1 Intel",
@@ -2896,7 +3166,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "POLARIS1701I1650TI"),
 		},
-		.driver_data = &tux_featureset_1_nvidia_descriptor,
+		.driver_data = &polaris_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 17 Gen1 Intel",
@@ -2904,7 +3174,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "POLARIS1701I2060"),
 		},
-		.driver_data = &tux_featureset_1_nvidia_descriptor,
+		.driver_data = &polaris_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Trinity 15 Intel Gen1",
@@ -2928,7 +3198,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GMxMGxx"),
 		},
-		.driver_data = &tux_featureset_2_nvidia_descriptor,
+		.driver_data = &polaris_gen2_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 15/17 Gen2 Intel",
@@ -3072,7 +3342,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "PULSE1401"),
 		},
-		.driver_data = &tux_featureset_1_descriptor,
+		.driver_data = &pulse_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Pulse 15 Gen1 AMD",
@@ -3080,7 +3350,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "PULSE1501"),
 		},
-		.driver_data = &tux_featureset_1_descriptor,
+		.driver_data = &pulse_gen1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Pulse 15 Gen2 AMD",
@@ -3129,6 +3399,8 @@ static int __init uniwill_init(void)
 		device_descriptor.kbd_led_max_brightness = 4;
 		/* Some models only support 36 brightness levels per color component */
 		device_descriptor.lightbar_max_brightness = 200;
+		/* Assume three performance profiles */
+		device_descriptor.num_profiles = 3;
 		pr_warn("Enabling potentially unsupported features\n");
 	}
 
