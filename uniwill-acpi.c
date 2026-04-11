@@ -380,6 +380,7 @@
 #define UNIWILL_FEATURE_KEYBOARD_BACKLIGHT	BIT(12)
 #define UNIWILL_FEATURE_AC_AUTO_BOOT		BIT(13)
 #define UNIWILL_FEATURE_USB_POWERSHARE		BIT(14)
+#define UNIWILL_FEATURE_CPU_TDP_CONTROL		BIT(15)
 
 enum usb_c_power_priority_options {
 	USB_C_POWER_PRIORITY_CHARGING = 0,
@@ -425,6 +426,9 @@ struct uniwill_data {
 	unsigned int last_fan_ctrl;
 	bool custom_profile_mode_needed;
 	bool has_universal_fan_ctrl;
+	bool has_double_pl4;
+	unsigned int tdp_min[3];
+	unsigned int tdp_max[3];
 	unsigned int fan_mode;		/* 0=full-speed, 1=manual, 2=auto */
 	unsigned int last_fan_pwm[2];	/* Saved PWM values per fan for suspend/resume */
 	bool boost_active;		/* True when EC is in boost (FAN_MODE_BOOST) mode */
@@ -444,6 +448,14 @@ struct uniwill_device_descriptor {
 	unsigned int lightbar_max_brightness;
 	unsigned int num_profiles;
 	bool custom_profile_mode_needed;
+	/*
+	 * Per-device CPU TDP limits in watts.
+	 * Index 0 = PL1, 1 = PL2, 2 = PL4.
+	 * A zero max value means the corresponding PL level is not supported.
+	 * PL4 values are in effective watts (pre-doubling for double_pl4 devices).
+	 */
+	unsigned int tdp_min[3];
+	unsigned int tdp_max[3];
 	/* Executed during driver probing */
 	int (*probe)(struct uniwill_data *data);
 };
@@ -627,6 +639,9 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
 	case EC_ADDR_CTGP_DB_DB_OFFSET:
+	case EC_ADDR_PL1_SETTING:
+	case EC_ADDR_PL2_SETTING:
+	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
@@ -683,6 +698,9 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
 	case EC_ADDR_CTGP_DB_DB_OFFSET:
+	case EC_ADDR_PL1_SETTING:
+	case EC_ADDR_PL2_SETTING:
+	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_FAN_CTRL:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
@@ -719,6 +737,9 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SWITCH_STATUS:
 	case EC_ADDR_KBD_STATUS:
 	case EC_ADDR_CUSTOM_PROFILE:
+	case EC_ADDR_PL1_SETTING:
+	case EC_ADDR_PL2_SETTING:
+	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
@@ -1059,6 +1080,211 @@ static int uniwill_nvidia_ctgp_init(struct uniwill_data *data)
 	return 0;
 }
 
+static ssize_t cpu_pl1_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &value);
+	if (ret < 0)
+		return ret;
+
+	if (value < data->tdp_min[0] || value > data->tdp_max[0])
+		return -EINVAL;
+
+	ret = regmap_write(data->regmap, EC_ADDR_PL1_SETTING, value);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static ssize_t cpu_pl1_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_PL1_SETTING, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", value);
+}
+
+static DEVICE_ATTR_RW(cpu_pl1);
+
+static ssize_t cpu_pl1_min_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->tdp_min[0]);
+}
+
+static DEVICE_ATTR_RO(cpu_pl1_min);
+
+static ssize_t cpu_pl1_max_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->tdp_max[0]);
+}
+
+static DEVICE_ATTR_RO(cpu_pl1_max);
+
+static ssize_t cpu_pl2_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &value);
+	if (ret < 0)
+		return ret;
+
+	if (value < data->tdp_min[1] || value > data->tdp_max[1])
+		return -EINVAL;
+
+	ret = regmap_write(data->regmap, EC_ADDR_PL2_SETTING, value);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static ssize_t cpu_pl2_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_PL2_SETTING, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", value);
+}
+
+static DEVICE_ATTR_RW(cpu_pl2);
+
+static ssize_t cpu_pl2_min_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->tdp_min[1]);
+}
+
+static DEVICE_ATTR_RO(cpu_pl2_min);
+
+static ssize_t cpu_pl2_max_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->tdp_max[1]);
+}
+
+static DEVICE_ATTR_RO(cpu_pl2_max);
+
+static ssize_t cpu_pl4_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	u8 ec_value;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &value);
+	if (ret < 0)
+		return ret;
+
+	if (value < data->tdp_min[2] || value > data->tdp_max[2])
+		return -EINVAL;
+
+	/*
+	 * Some devices store half the PL4 value in the EC register.
+	 * The maximum effective PL4 is thus 510 W on those devices.
+	 */
+	if (data->has_double_pl4)
+		ec_value = value / 2;
+	else
+		ec_value = value;
+
+	ret = regmap_write(data->regmap, EC_ADDR_PL4_SETTING, ec_value);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static ssize_t cpu_pl4_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_PL4_SETTING, &value);
+	if (ret < 0)
+		return ret;
+
+	if (data->has_double_pl4)
+		value *= 2;
+
+	return sysfs_emit(buf, "%u\n", value);
+}
+
+static DEVICE_ATTR_RW(cpu_pl4);
+
+static ssize_t cpu_pl4_min_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->tdp_min[2]);
+}
+
+static DEVICE_ATTR_RO(cpu_pl4_min);
+
+static ssize_t cpu_pl4_max_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->tdp_max[2]);
+}
+
+static DEVICE_ATTR_RO(cpu_pl4_max);
+
+static int uniwill_cpu_tdp_init(struct uniwill_data *data)
+{
+	unsigned int value;
+	int ret;
+
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL))
+		return 0;
+
+	/*
+	 * Detect double PL4 mode. Bit 7 of EC register 0x0727 indicates
+	 * that PL4 values written to the EC need to be halved.
+	 */
+	ret = regmap_read(data->regmap, EC_ADDR_CUSTOM_PROFILE, &value);
+	if (ret < 0)
+		return ret;
+
+	data->has_double_pl4 = !!(value & BIT(7));
+
+	return 0;
+}
+
 static const char * const USB_C_POWER_PRIORITY_TEXT[] = {
 	[USB_C_POWER_PRIORITY_CHARGING]		= "charging",
 	[USB_C_POWER_PRIORITY_PERFORMANCE]	= "performance",
@@ -1287,6 +1513,15 @@ static struct attribute *uniwill_attrs[] = {
 	/* Power-management-related */
 	&dev_attr_ctgp_offset.attr,
 	&dev_attr_dynamic_boost_enable.attr,
+	&dev_attr_cpu_pl1.attr,
+	&dev_attr_cpu_pl1_min.attr,
+	&dev_attr_cpu_pl1_max.attr,
+	&dev_attr_cpu_pl2.attr,
+	&dev_attr_cpu_pl2_min.attr,
+	&dev_attr_cpu_pl2_max.attr,
+	&dev_attr_cpu_pl4.attr,
+	&dev_attr_cpu_pl4_min.attr,
+	&dev_attr_cpu_pl4_max.attr,
 	&dev_attr_usb_c_power_priority.attr,
 	&dev_attr_ac_auto_boot.attr,
 	&dev_attr_usb_powershare_high.attr,
@@ -1328,6 +1563,30 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 
 	if (attr == &dev_attr_dynamic_boost_enable.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_cpu_pl1.attr ||
+	    attr == &dev_attr_cpu_pl1_min.attr ||
+	    attr == &dev_attr_cpu_pl1_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
+		    data->tdp_max[0])
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_cpu_pl2.attr ||
+	    attr == &dev_attr_cpu_pl2_min.attr ||
+	    attr == &dev_attr_cpu_pl2_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
+		    data->tdp_max[1])
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_cpu_pl4.attr ||
+	    attr == &dev_attr_cpu_pl4_min.attr ||
+	    attr == &dev_attr_cpu_pl4_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
+		    data->tdp_max[2])
 			return attr->mode;
 	}
 
@@ -3040,6 +3299,8 @@ static int uniwill_probe(struct platform_device *pdev)
 	data->lightbar_max_brightness = device_descriptor.lightbar_max_brightness;
 	data->num_profiles = device_descriptor.num_profiles;
 	data->custom_profile_mode_needed = device_descriptor.custom_profile_mode_needed;
+	memcpy(data->tdp_min, device_descriptor.tdp_min, sizeof(data->tdp_min));
+	memcpy(data->tdp_max, device_descriptor.tdp_max, sizeof(data->tdp_max));
 
 	/* Auto-detect mini LED local dimming support */
 	data->has_mini_led_dimming = uniwill_has_mini_led_dimming(data);
@@ -3089,6 +3350,10 @@ static int uniwill_probe(struct platform_device *pdev)
 		return ret;
 
 	ret = uniwill_nvidia_ctgp_init(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_cpu_tdp_init(data);
 	if (ret < 0)
 		return ret;
 
@@ -3644,21 +3909,115 @@ static struct uniwill_device_descriptor tux_featureset_3_cpm_descriptor __initda
 		    UNIWILL_FEATURE_SECONDARY_FAN |
 		    UNIWILL_FEATURE_KEYBOARD_BACKLIGHT |
 		    UNIWILL_FEATURE_AC_AUTO_BOOT |
-		    UNIWILL_FEATURE_USB_POWERSHARE,
+		    UNIWILL_FEATURE_USB_POWERSHARE |
+		    UNIWILL_FEATURE_CPU_TDP_CONTROL,
 	.kbd_led_max_brightness = 4,
 	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
 };
 
-static struct uniwill_device_descriptor tux_featureset_3_nvidia_cpm_descriptor __initdata = {
-	.features = UNIWILL_FEATURE_FN_LOCK |
-		    UNIWILL_FEATURE_SUPER_KEY |
-		    UNIWILL_FEATURE_CPU_TEMP |
-		    UNIWILL_FEATURE_GPU_TEMP |
-		    UNIWILL_FEATURE_PRIMARY_FAN |
-		    UNIWILL_FEATURE_SECONDARY_FAN |
-		    UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL,
+/*
+ * The featureset 3 nvidia cpm devices share the same base features but
+ * have different CPU TDP limits per board. Each board that supports TDP
+ * gets its own descriptor with the appropriate bounds.
+ */
+
+#define TUX_FEATURESET_3_NVIDIA_CPM_FEATURES		\
+	(UNIWILL_FEATURE_FN_LOCK |			\
+	 UNIWILL_FEATURE_SUPER_KEY |			\
+	 UNIWILL_FEATURE_CPU_TEMP |			\
+	 UNIWILL_FEATURE_GPU_TEMP |			\
+	 UNIWILL_FEATURE_PRIMARY_FAN |			\
+	 UNIWILL_FEATURE_SECONDARY_FAN |		\
+	 UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL |		\
+	 UNIWILL_FEATURE_CPU_TDP_CONTROL)
+
+/* TUXEDO Stellaris Slim 15 Gen6 AMD (GMxHGxx) */
+static struct uniwill_device_descriptor gmxhgxx_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
 	.custom_profile_mode_needed = true,
+	.tdp_min = { 5, 5, 5 },
+	.tdp_max = { 90, 90, 100 },
+};
+
+/* TUXEDO Stellaris Slim 15 Gen6 Intel (GM5IXxA) */
+static struct uniwill_device_descriptor gm5ixxa_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 5, 5, 5 },
+	.tdp_max = { 140, 140, 200 },
+};
+
+/* TUXEDO Stellaris 16 Gen6 Intel MB1 (GM6IXxB_MB1) */
+static struct uniwill_device_descriptor gm6ixxb_mb1_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 5, 5, 5 },
+	.tdp_max = { 205, 205, 400 },
+};
+
+/* TUXEDO Stellaris 16 Gen6 Intel MB2 (GM6IXxB_MB2) */
+static struct uniwill_device_descriptor gm6ixxb_mb2_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 5, 5, 5 },
+	.tdp_max = { 160, 160, 250 },
+};
+
+/* TUXEDO Stellaris 17 Gen6 Intel (GM7IXxN) */
+static struct uniwill_device_descriptor gm7ixxn_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 5, 5, 5 },
+	.tdp_max = { 160, 160, 250 },
+};
+
+/* TUXEDO Stellaris 16 Gen7 Intel (X6AR5xxY / X6AR5xxY_mLED) */
+static struct uniwill_device_descriptor x6ar5xxy_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 5, 5, 5 },
+	.tdp_max = { 210, 210, 420 },
+};
+
+/* TUXEDO Stellaris 16 Gen7 AMD (X6FR5xxY) */
+static struct uniwill_device_descriptor x6fr5xxy_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 25, 25, 25 },
+	.tdp_max = { 162, 162, 195 },
+};
+
+/* TUXEDO InfinityBook Max 15 Gen10 AMD (X5KK45xS_X5SP45xS) */
+static struct uniwill_device_descriptor x5kk45xs_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 10, 10, 10 },
+	.tdp_max = { 100, 100, 105 },
+};
+
+/* TUXEDO InfinityBook Max 16 Gen10 AMD (X6KK45xU_X6SP45xU) */
+static struct uniwill_device_descriptor x6kk45xu_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 10, 10, 10 },
+	.tdp_max = { 100, 100, 105 },
+};
+
+/* TUXEDO InfinityBook Max 15 Gen10 Intel (X5AR45xS) */
+static struct uniwill_device_descriptor x5ar45xs_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 10, 10, 10 },
+	.tdp_max = { 90, 90, 230 },
+};
+
+/* TUXEDO InfinityBook Max 16 Gen10 Intel (X6AR55xU) */
+static struct uniwill_device_descriptor x6ar55xu_descriptor __initdata = {
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.custom_profile_mode_needed = true,
+	.tdp_min = { 10, 10, 10 },
+	.tdp_max = { 145, 155, 290 },
 };
 
 static int phxtxx1_probe(struct uniwill_data *data)
@@ -3899,7 +4258,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X5KK45xS_X5SP45xS"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &x5kk45xs_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Max 16 Gen10 AMD",
@@ -3915,7 +4274,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6KK45xU_X6SP45xU"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &x6kk45xu_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Max 15 Gen10 Intel",
@@ -3923,7 +4282,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X5AR45xS"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &x5ar45xs_descriptor,
 	},
 	{
 		.ident = "TUXEDO InfinityBook Max 16 Gen10 Intel",
@@ -3931,7 +4290,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6AR55xU"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &x6ar55xu_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 15 Gen1 AMD",
@@ -4091,7 +4450,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GMxHGxx"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &gmxhgxx_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris Slim 15 Gen6 Intel/Commodore ORION Slim 15 Gen6",
@@ -4099,7 +4458,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GM5IXxA"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &gm5ixxa_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen6 Intel/Commodore ORION 16 Gen6",
@@ -4107,7 +4466,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GM6IXxB_MB1"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &gm6ixxb_mb1_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen6 Intel/Commodore ORION 16 Gen6",
@@ -4115,7 +4474,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GM6IXxB_MB2"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &gm6ixxb_mb2_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 17 Gen6 Intel/Commodore ORION 17 Gen6",
@@ -4123,7 +4482,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GM7IXxN"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &gm7ixxn_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen7 AMD",
@@ -4131,7 +4490,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6FR5xxY"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &x6fr5xxy_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen7 Intel",
@@ -4139,7 +4498,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6AR5xxY"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &x6ar5xxy_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 16 Gen7 Intel",
@@ -4147,7 +4506,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6AR5xxY_mLED"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &x6ar5xxy_descriptor,
 	},
 	{
 		.ident = "XMG NEO 16 (E25)",
@@ -4155,7 +4514,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "SchenkerTechnologiesGmbH"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6AR5xxY"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &x6ar5xxy_descriptor,
 	},
 	{
 		.ident = "XMG NEO 16 (A25)",
@@ -4163,7 +4522,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "SchenkerTechnologiesGmbH"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6FR5xxY"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+		.driver_data = &x6fr5xxy_descriptor,
 	},
 	{
 		.ident = "TUXEDO Book BA15 Gen10 AMD",
