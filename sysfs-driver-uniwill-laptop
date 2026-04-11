@@ -64,6 +64,18 @@ Description:
 
 		Reading this file returns the current configurable TGP offset.
 
+What:		/sys/bus/platform/devices/INOU0000:XX/dynamic_boost_enable
+Date:		July 2026
+KernelVersion:	6.16
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Allows userspace applications to enable or disable NVIDIA Dynamic Boost. When
+		enabled, the GPU may draw up to 25 additional watts from surplus CPU power headroom.
+		Writing "1" enables Dynamic Boost; writing "0" disables it. The driver enables
+		Dynamic Boost by default. The setting is preserved across system suspend/resume.
+
+		Reading this file returns 1 if Dynamic Boost is currently enabled, 0 otherwise.
+
 What:		/sys/bus/platform/devices/INOU0000:XX/usb_c_power_priority
 Date:		February 2026
 KernelVersion:	7.1
