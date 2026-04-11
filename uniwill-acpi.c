@@ -4150,6 +4150,22 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
 	},
 	{
+		.ident = "XMG NEO 16 (E25)",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "SchenkerTechnologiesGmbH"),
+			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6AR5xxY"),
+		},
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+	},
+	{
+		.ident = "XMG NEO 16 (A25)",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "SchenkerTechnologiesGmbH"),
+			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6FR5xxY"),
+		},
+		.driver_data = &tux_featureset_3_nvidia_cpm_descriptor,
+	},
+	{
 		.ident = "TUXEDO Book BA15 Gen10 AMD",
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
@@ -4251,3 +4267,4 @@ module_exit(uniwill_exit);
 MODULE_AUTHOR("Armin Wolf <W_Armin@gmx.de>");
 MODULE_DESCRIPTION("Uniwill notebook driver");
 MODULE_LICENSE("GPL");
+MODULE_SOFTDEP("pre: led-class-multicolor");
