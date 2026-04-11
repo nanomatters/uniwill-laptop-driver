@@ -424,6 +424,10 @@ struct uniwill_data {
 	unsigned int num_profiles;
 	unsigned int last_fan_ctrl;
 	bool custom_profile_mode_needed;
+	bool has_universal_fan_ctrl;
+	unsigned int fan_mode;		/* 0=full-speed, 1=manual, 2=auto */
+	unsigned int last_fan_pwm[2];	/* Saved PWM values per fan for suspend/resume */
+	bool boost_active;		/* True when EC is in boost (FAN_MODE_BOOST) mode */
 	bool has_mini_led_dimming;
 	bool mini_led_dimming_state;
 };
@@ -623,7 +627,15 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
 	case EC_ADDR_CTGP_DB_DB_OFFSET:
 	case EC_ADDR_MANUAL_FAN_CTRL:
+	case EC_ADDR_UNIVERSAL_FAN_CTRL:
+	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
+	case EC_ADDR_CPU_TEMP_END_TABLE ... EC_ADDR_CPU_TEMP_END_TABLE + 0xF:
+	case EC_ADDR_CPU_TEMP_START_TABLE ... EC_ADDR_CPU_TEMP_START_TABLE + 0xF:
+	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
+	case EC_ADDR_GPU_TEMP_END_TABLE ... EC_ADDR_GPU_TEMP_END_TABLE + 0xF:
+	case EC_ADDR_GPU_TEMP_START_TABLE ... EC_ADDR_GPU_TEMP_START_TABLE + 0xF:
+	case EC_ADDR_GPU_FAN_SPEED_TABLE ... EC_ADDR_GPU_FAN_SPEED_TABLE + 0xF:
 		return true;
 	default:
 		return false;
@@ -671,8 +683,17 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
 	case EC_ADDR_CTGP_DB_DB_OFFSET:
 	case EC_ADDR_MANUAL_FAN_CTRL:
+	case EC_ADDR_FAN_CTRL:
+	case EC_ADDR_UNIVERSAL_FAN_CTRL:
+	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_MINI_LED_SUPPORT:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
+	case EC_ADDR_CPU_TEMP_END_TABLE ... EC_ADDR_CPU_TEMP_END_TABLE + 0xF:
+	case EC_ADDR_CPU_TEMP_START_TABLE ... EC_ADDR_CPU_TEMP_START_TABLE + 0xF:
+	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
+	case EC_ADDR_GPU_TEMP_END_TABLE ... EC_ADDR_GPU_TEMP_END_TABLE + 0xF:
+	case EC_ADDR_GPU_TEMP_START_TABLE ... EC_ADDR_GPU_TEMP_START_TABLE + 0xF:
+	case EC_ADDR_GPU_FAN_SPEED_TABLE ... EC_ADDR_GPU_FAN_SPEED_TABLE + 0xF:
 		return true;
 	default:
 		return false;
@@ -700,6 +721,8 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
+	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
+	case EC_ADDR_GPU_FAN_SPEED_TABLE ... EC_ADDR_GPU_FAN_SPEED_TABLE + 0xF:
 		return true;
 	default:
 		return false;
@@ -1315,7 +1338,6 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		}
 		break;
 	case hwmon_fan:
-	case hwmon_pwm:
 		switch (channel) {
 		case 0:
 			feature = UNIWILL_FEATURE_PRIMARY_FAN;
@@ -1327,6 +1349,31 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 			return 0;
 		}
 		break;
+	case hwmon_pwm:
+		switch (channel) {
+		case 0:
+			feature = UNIWILL_FEATURE_PRIMARY_FAN;
+			break;
+		case 1:
+			feature = UNIWILL_FEATURE_SECONDARY_FAN;
+			break;
+		default:
+			return 0;
+		}
+
+		if (!uniwill_device_supports(data, feature))
+			return 0;
+
+		switch (attr) {
+		case hwmon_pwm_enable:
+			return 0644;
+		case hwmon_pwm_input:
+			if (data->has_universal_fan_ctrl)
+				return 0644;
+			return 0444;
+		default:
+			return 0;
+		}
 	default:
 		return 0;
 	}
@@ -1383,22 +1430,43 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 		*val = be16_to_cpu(rpm);
 		return 0;
 	case hwmon_pwm:
-		switch (channel) {
-		case 0:
-			ret = regmap_read(data->regmap, EC_ADDR_PWM_1, &value);
-			break;
-		case 1:
-			ret = regmap_read(data->regmap, EC_ADDR_PWM_2, &value);
-			break;
+		switch (attr) {
+		case hwmon_pwm_enable:
+			*val = data->fan_mode;
+			return 0;
+		case hwmon_pwm_input:
+			/*
+			 * When boost is active, the EC reports 0xFF in the
+			 * PWM status register. Return the last value written
+			 * by the user instead. When manual mode is set but
+			 * boost isn't active yet, read the real EC value.
+			 */
+			if (data->fan_mode == 1 && data->boost_active) {
+				*val = fixp_linear_interpolate(0, 0, PWM_MAX,
+							      U8_MAX,
+							      data->last_fan_pwm[channel]);
+				return 0;
+			}
+
+			switch (channel) {
+			case 0:
+				ret = regmap_read(data->regmap, EC_ADDR_PWM_1, &value);
+				break;
+			case 1:
+				ret = regmap_read(data->regmap, EC_ADDR_PWM_2, &value);
+				break;
+			default:
+				return -EOPNOTSUPP;
+			}
+
+			if (ret < 0)
+				return ret;
+
+			*val = fixp_linear_interpolate(0, 0, PWM_MAX, U8_MAX, value);
+			return 0;
 		default:
 			return -EOPNOTSUPP;
 		}
-
-		if (ret < 0)
-			return ret;
-
-		*val = fixp_linear_interpolate(0, 0, PWM_MAX, U8_MAX, value);
-		return 0;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -1419,10 +1487,256 @@ static int uniwill_read_string(struct device *dev, enum hwmon_sensor_types type,
 	}
 }
 
+#define FAN_TABLE_ZONES		16
+#define FAN_TABLE_MAX_TEMP	115
+#define FAN_TABLE_MAX_SPEED	0xC8	/* 200 = full speed */
+
+static int uniwill_fan_init_tables(struct uniwill_data *data)
+{
+	unsigned int cpu_speed, gpu_speed;
+	int i, ret;
+
+	/*
+	 * Initialize custom fan tables with a single controllable zone spanning
+	 * from 0 to 115 degrees, and fill the remaining zones with safety dummy
+	 * entries at increasing temperatures beyond the controllable range.
+	 *
+	 * For zone 0 (the controllable zone), preserve the current fan speed
+	 * read from the EC so that switching to manual mode does not cause an
+	 * unexpected speed change. Fall back to full speed if the read fails.
+	 */
+	if (regmap_read(data->regmap, EC_ADDR_PWM_1, &cpu_speed) < 0)
+		cpu_speed = FAN_TABLE_MAX_SPEED;
+	else
+		cpu_speed = min(cpu_speed, (unsigned int)FAN_TABLE_MAX_SPEED);
+
+	if (regmap_read(data->regmap, EC_ADDR_PWM_2, &gpu_speed) < 0)
+		gpu_speed = FAN_TABLE_MAX_SPEED;
+	else
+		gpu_speed = min(gpu_speed, (unsigned int)FAN_TABLE_MAX_SPEED);
+
+	data->last_fan_pwm[0] = cpu_speed;
+	data->last_fan_pwm[1] = gpu_speed;
+
+	ret = regmap_write(data->regmap, EC_ADDR_CPU_TEMP_END_TABLE, FAN_TABLE_MAX_TEMP);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_write(data->regmap, EC_ADDR_CPU_TEMP_START_TABLE, 0);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_write(data->regmap, EC_ADDR_CPU_FAN_SPEED_TABLE, cpu_speed);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_write(data->regmap, EC_ADDR_GPU_TEMP_END_TABLE, FAN_TABLE_MAX_TEMP + 5);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_write(data->regmap, EC_ADDR_GPU_TEMP_START_TABLE, 0);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_write(data->regmap, EC_ADDR_GPU_FAN_SPEED_TABLE, gpu_speed);
+	if (ret < 0)
+		return ret;
+
+	for (i = 1; i < FAN_TABLE_ZONES; i++) {
+		ret = regmap_write(data->regmap,
+				   EC_ADDR_CPU_TEMP_END_TABLE + i,
+				   FAN_TABLE_MAX_TEMP + i + 1);
+		if (ret < 0)
+			return ret;
+
+		ret = regmap_write(data->regmap,
+				   EC_ADDR_CPU_TEMP_START_TABLE + i,
+				   FAN_TABLE_MAX_TEMP + i);
+		if (ret < 0)
+			return ret;
+
+		ret = regmap_write(data->regmap,
+				   EC_ADDR_CPU_FAN_SPEED_TABLE + i,
+				   FAN_TABLE_MAX_SPEED);
+		if (ret < 0)
+			return ret;
+
+		ret = regmap_write(data->regmap,
+				   EC_ADDR_GPU_TEMP_END_TABLE + i,
+				   FAN_TABLE_MAX_TEMP + i + 1);
+		if (ret < 0)
+			return ret;
+
+		ret = regmap_write(data->regmap,
+				   EC_ADDR_GPU_TEMP_START_TABLE + i,
+				   FAN_TABLE_MAX_TEMP + i);
+		if (ret < 0)
+			return ret;
+
+		ret = regmap_write(data->regmap,
+				   EC_ADDR_GPU_FAN_SPEED_TABLE + i,
+				   FAN_TABLE_MAX_SPEED);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int uniwill_fan_enable_custom_tables(struct uniwill_data *data)
+{
+	int ret;
+
+	ret = uniwill_fan_init_tables(data);
+	if (ret < 0)
+		return ret;
+
+	/* Enable split tables so CPU and GPU fans use separate curves */
+	ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
+			      SPLIT_TABLES);
+	if (ret < 0)
+		return ret;
+
+	/* Enable custom fan tables */
+	return regmap_set_bits(data->regmap, EC_ADDR_AP_OEM_6,
+			       ENABLE_UNIVERSAL_FAN_CTRL);
+}
+
+static int uniwill_fan_disable_custom_tables(struct uniwill_data *data)
+{
+	int ret;
+
+	/* Disable custom fan tables */
+	ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_OEM_6,
+				ENABLE_UNIVERSAL_FAN_CTRL);
+	if (ret < 0)
+		return ret;
+
+	/* Disable split tables */
+	return regmap_clear_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
+				 SPLIT_TABLES);
+}
+
+static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
+{
+	int ret;
+
+	switch (mode) {
+	case 0:	/* Full speed */
+		ret = regmap_set_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+				      FAN_MODE_BOOST);
+		if (ret < 0)
+			return ret;
+
+		data->boost_active = true;
+		data->fan_mode = 0;
+		return 0;
+	case 1:	/* Manual */
+		if (!data->has_universal_fan_ctrl)
+			return -EOPNOTSUPP;
+
+		/*
+		 * Don't enable boost mode here. The EC briefly ramps fans
+		 * to full speed on boost entry. Defer boost activation to
+		 * the first PWM write where we have the desired speed to
+		 * immediately counter the ramp-up via burst writes.
+		 */
+		data->fan_mode = 1;
+		return 0;
+	case 2:	/* Automatic */
+		ret = regmap_clear_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+					FAN_MODE_BOOST);
+		if (ret < 0)
+			return ret;
+
+		data->boost_active = false;
+		data->fan_mode = 2;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int uniwill_set_pwm(struct uniwill_data *data, int channel, long val)
+{
+	unsigned int ec_val;
+	int ret, i;
+
+	if (data->fan_mode != 1)
+		return -EBUSY;
+
+	if (val < 0 || val > U8_MAX)
+		return -EINVAL;
+
+	ec_val = fixp_linear_interpolate(0, 0, U8_MAX, PWM_MAX, val);
+
+	data->last_fan_pwm[channel] = ec_val;
+
+	if (!data->boost_active) {
+		/*
+		 * Enable boost mode so direct writes to the fan speed
+		 * registers (0x1804/0x1809) are respected by the EC.
+		 *
+		 * The EC briefly ramps fans to full speed on boost
+		 * entry, overriding a single write. Repeat the write
+		 * until the EC settles.
+		 */
+		ret = regmap_set_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+				      FAN_MODE_BOOST);
+		if (ret < 0)
+			return ret;
+
+		for (i = 0; i < 10; i++) {
+			uniwill_wmi_ec_write(EC_ADDR_PWM_1_WRITEABLE,
+					     data->last_fan_pwm[0]);
+			uniwill_wmi_ec_write(EC_ADDR_PWM_2_WRITEABLE,
+					     data->last_fan_pwm[1]);
+			msleep(10);
+		}
+
+		data->boost_active = true;
+		return 0;
+	}
+
+	/*
+	 * Write fan speed via WMI since these registers are not
+	 * reachable through ACPI ECRW.
+	 */
+	switch (channel) {
+	case 0:
+		return uniwill_wmi_ec_write(EC_ADDR_PWM_1_WRITEABLE, ec_val);
+	case 1:
+		return uniwill_wmi_ec_write(EC_ADDR_PWM_2_WRITEABLE, ec_val);
+	default:
+		return -EINVAL;
+	}
+}
+
+static int uniwill_write(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+			 int channel, long val)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	switch (type) {
+	case hwmon_pwm:
+		switch (attr) {
+		case hwmon_pwm_enable:
+			return uniwill_set_fan_mode(data, val);
+		case hwmon_pwm_input:
+			return uniwill_set_pwm(data, channel, val);
+		default:
+			return -EOPNOTSUPP;
+		}
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static const struct hwmon_ops uniwill_ops = {
 	.is_visible = uniwill_is_visible,
 	.read = uniwill_read,
 	.read_string = uniwill_read_string,
+	.write = uniwill_write,
 };
 
 static const struct hwmon_channel_info * const uniwill_info[] = {
@@ -1434,8 +1748,8 @@ static const struct hwmon_channel_info * const uniwill_info[] = {
 			   HWMON_F_INPUT | HWMON_F_LABEL,
 			   HWMON_F_INPUT | HWMON_F_LABEL),
 	HWMON_CHANNEL_INFO(pwm,
-			   HWMON_PWM_INPUT,
-			   HWMON_PWM_INPUT),
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
 	NULL
 };
 
@@ -1471,6 +1785,19 @@ static bool uniwill_has_mini_led_dimming(struct uniwill_data *data)
 		return false;
 
 	return value != 0xFF && (value & BIT(0));
+}
+
+static bool uniwill_has_universal_fan_ctrl(struct uniwill_data *data)
+{
+	unsigned int value;
+
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN))
+		return false;
+
+	if (regmap_read(data->regmap, EC_ADDR_FAN_CTRL, &value) < 0)
+		return false;
+
+	return !!(value & UNIVERSAL_FAN_CTRL);
 }
 
 static int uniwill_mini_led_init(struct uniwill_data *data)
@@ -2384,6 +2711,10 @@ static int uniwill_probe(struct platform_device *pdev)
 	/* Auto-detect mini LED local dimming support */
 	data->has_mini_led_dimming = uniwill_has_mini_led_dimming(data);
 
+	/* Auto-detect universal fan control support */
+	data->has_universal_fan_ctrl = uniwill_has_universal_fan_ctrl(data);
+	data->fan_mode = 2;
+
 	/*
 	 * Some devices might need to perform some device-specific initialization steps
 	 * before the supported features are initialized. Because of this we have to call
@@ -2546,6 +2877,19 @@ static int uniwill_suspend_custom_profile(struct uniwill_data *data)
 				CUSTOM_PROFILE_MODE);
 }
 
+static int uniwill_suspend_fan_mode(struct uniwill_data *data)
+{
+	switch (data->fan_mode) {
+	case 0:	/* Full speed - clear boost before suspend */
+		return regmap_clear_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+					 FAN_MODE_BOOST);
+	case 1:	/* Manual - disable custom tables before suspend */
+		return uniwill_fan_disable_custom_tables(data);
+	default:
+		return 0;
+	}
+}
+
 static int uniwill_suspend(struct device *dev)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2580,6 +2924,10 @@ static int uniwill_suspend(struct device *dev)
 		return ret;
 
 	ret = uniwill_suspend_custom_profile(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_suspend_fan_mode(data);
 	if (ret < 0)
 		return ret;
 
@@ -2687,6 +3035,27 @@ static int uniwill_resume_custom_profile(struct uniwill_data *data)
 			       CUSTOM_PROFILE_MODE);
 }
 
+static int uniwill_resume_fan_mode(struct uniwill_data *data)
+{
+	int ret;
+
+	switch (data->fan_mode) {
+	case 0:	/* Full speed - restore boost */
+		return regmap_set_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+				       FAN_MODE_BOOST);
+	case 1:	/* Manual - re-enable custom tables */
+		ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
+				      SPLIT_TABLES);
+		if (ret < 0)
+			return ret;
+
+		return regmap_set_bits(data->regmap, EC_ADDR_AP_OEM_6,
+				       ENABLE_UNIVERSAL_FAN_CTRL);
+	default:
+		return 0;
+	}
+}
+
 static int uniwill_resume_mini_led(struct uniwill_data *data)
 {
 	if (!data->has_mini_led_dimming)
@@ -2744,6 +3113,10 @@ static int uniwill_resume(struct device *dev)
 		return ret;
 
 	ret = uniwill_resume_custom_profile(data);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_resume_fan_mode(data);
 	if (ret < 0)
 		return ret;
 
