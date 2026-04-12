@@ -383,6 +383,7 @@
 #define UNIWILL_FEATURE_AC_AUTO_BOOT		BIT(13)
 #define UNIWILL_FEATURE_USB_POWERSHARE		BIT(14)
 #define UNIWILL_FEATURE_CPU_TDP_CONTROL		BIT(15)
+#define UNIWILL_FEATURE_WATER_COOLER		BIT(16)
 
 enum usb_c_power_priority_options {
 	USB_C_POWER_PRIORITY_CHARGING = 0,
@@ -4027,6 +4028,17 @@ static struct uniwill_device_descriptor tux_featureset_3_nvidia_descriptor __ini
 		    UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL,
 };
 
+static struct uniwill_device_descriptor tux_featureset_3_nvidia_wc_descriptor __initdata = {
+	.features = UNIWILL_FEATURE_FN_LOCK |
+		    UNIWILL_FEATURE_SUPER_KEY |
+		    UNIWILL_FEATURE_CPU_TEMP |
+		    UNIWILL_FEATURE_GPU_TEMP |
+		    UNIWILL_FEATURE_PRIMARY_FAN |
+		    UNIWILL_FEATURE_SECONDARY_FAN |
+		    UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL |
+		    UNIWILL_FEATURE_WATER_COOLER,
+};
+
 static struct uniwill_device_descriptor tux_featureset_3_cpm_descriptor __initdata = {
 	.features = UNIWILL_FEATURE_FN_LOCK |
 		    UNIWILL_FEATURE_SUPER_KEY |
@@ -4076,7 +4088,8 @@ static struct uniwill_device_descriptor gm5ixxa_descriptor __initdata = {
 
 /* TUXEDO Stellaris 16 Gen6 Intel MB1 (GM6IXxB_MB1) */
 static struct uniwill_device_descriptor gm6ixxb_mb1_descriptor __initdata = {
-	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
+		    UNIWILL_FEATURE_WATER_COOLER,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 5, 5, 5 },
 	.tdp_max = { 205, 205, 400 },
@@ -4084,7 +4097,8 @@ static struct uniwill_device_descriptor gm6ixxb_mb1_descriptor __initdata = {
 
 /* TUXEDO Stellaris 16 Gen6 Intel MB2 (GM6IXxB_MB2) */
 static struct uniwill_device_descriptor gm6ixxb_mb2_descriptor __initdata = {
-	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
+		    UNIWILL_FEATURE_WATER_COOLER,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 5, 5, 5 },
 	.tdp_max = { 160, 160, 250 },
@@ -4092,7 +4106,8 @@ static struct uniwill_device_descriptor gm6ixxb_mb2_descriptor __initdata = {
 
 /* TUXEDO Stellaris 17 Gen6 Intel (GM7IXxN) */
 static struct uniwill_device_descriptor gm7ixxn_descriptor __initdata = {
-	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
+		    UNIWILL_FEATURE_WATER_COOLER,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 5, 5, 5 },
 	.tdp_max = { 160, 160, 250 },
@@ -4100,7 +4115,8 @@ static struct uniwill_device_descriptor gm7ixxn_descriptor __initdata = {
 
 /* TUXEDO Stellaris 16 Gen7 Intel (X6AR5xxY / X6AR5xxY_mLED) */
 static struct uniwill_device_descriptor x6ar5xxy_descriptor __initdata = {
-	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
+		    UNIWILL_FEATURE_WATER_COOLER,
 	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 5, 5, 5 },
@@ -4110,7 +4126,8 @@ static struct uniwill_device_descriptor x6ar5xxy_descriptor __initdata = {
 
 /* TUXEDO Stellaris 16 Gen7 AMD (X6FR5xxY) */
 static struct uniwill_device_descriptor x6fr5xxy_descriptor __initdata = {
-	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
+		    UNIWILL_FEATURE_WATER_COOLER,
 	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 25, 25, 25 },
@@ -4540,7 +4557,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GMxRGxx"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_wc_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris 15 Gen4 Intel",
@@ -4548,7 +4565,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GMxAGxx"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_wc_descriptor,
 	},
 	{
 		.ident = "TUXEDO Polaris 15/17 Gen5 AMD",
@@ -4572,7 +4589,7 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "GMxPXxx"),
 		},
-		.driver_data = &tux_featureset_3_nvidia_descriptor,
+		.driver_data = &tux_featureset_3_nvidia_wc_descriptor,
 	},
 	{
 		.ident = "TUXEDO Stellaris Slim 15 Gen6 AMD",
