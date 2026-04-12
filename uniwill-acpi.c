@@ -440,6 +440,9 @@ struct uniwill_data {
 	bool has_mini_led_dimming;
 	bool mini_led_dimming_state;
 	bool dynamic_boost_enable;
+	unsigned int ctgp_max;
+	unsigned int db_max;
+	unsigned int tgp_base;
 	/* Water cooler tunnel state */
 	struct {
 		struct mutex lock;	/* Protects all water cooler fields */
@@ -1011,6 +1014,9 @@ static ssize_t ctgp_offset_store(struct device *dev, struct device_attribute *at
 	if (value > U8_MAX)
 		return -EINVAL;
 
+	if (data->ctgp_max && value > data->ctgp_max)
+		return -EINVAL;
+
 	ret = regmap_write(data->regmap, EC_ADDR_CTGP_DB_CTGP_OFFSET, value);
 	if (ret < 0)
 		return ret;
@@ -1033,6 +1039,36 @@ static ssize_t ctgp_offset_show(struct device *dev, struct device_attribute *att
 }
 
 static DEVICE_ATTR_RW(ctgp_offset);
+
+static ssize_t ctgp_offset_max_show(struct device *dev, struct device_attribute *attr,
+				     char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->ctgp_max);
+}
+
+static DEVICE_ATTR_RO(ctgp_offset_max);
+
+static ssize_t db_offset_max_show(struct device *dev, struct device_attribute *attr,
+				  char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->db_max);
+}
+
+static DEVICE_ATTR_RO(db_offset_max);
+
+static ssize_t tgp_base_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->tgp_base);
+}
+
+static DEVICE_ATTR_RO(tgp_base);
 
 static ssize_t dynamic_boost_enable_store(struct device *dev, struct device_attribute *attr,
 					  const char *buf, size_t count)
@@ -1086,7 +1122,8 @@ static int uniwill_nvidia_ctgp_init(struct uniwill_data *data)
 	if (ret < 0)
 		return ret;
 
-	ret = regmap_write(data->regmap, EC_ADDR_CTGP_DB_DB_OFFSET, 25);
+	ret = regmap_write(data->regmap, EC_ADDR_CTGP_DB_DB_OFFSET,
+			    data->db_max ? data->db_max : 25);
 	if (ret < 0)
 		return ret;
 
@@ -1284,6 +1321,125 @@ static ssize_t cpu_pl4_max_show(struct device *dev, struct device_attribute *att
 
 static DEVICE_ATTR_RO(cpu_pl4_max);
 
+#define SMRW_BUFFER_SIZE	13
+#define SMRW_CMD_READ		0xBB
+#define SMRW_INDEX_PL1		0
+#define SMRW_INDEX_PL2		1
+#define SMRW_INDEX_PL4		2
+#define SMRW_INDEX_CTGP_MAX	4
+#define SMRW_INDEX_DB_MAX	5
+#define SMRW_INDEX_TGP_BASE	7
+
+/*
+ * Read a single entry from the ACPI SMRW configuration table.
+ *
+ * The SMRW method on the INOU device provides per-device power limits
+ * stored in firmware. The method takes a 13-byte buffer argument where
+ * byte 0 is the command (0xBB = read) and byte 1 is the table index.
+ * It returns a dword whose LSB is the config value.
+ */
+static int uniwill_smrw_read(struct uniwill_data *data, u8 index, u8 *val)
+{
+	union acpi_object param;
+	struct acpi_object_list input;
+	unsigned long long output;
+	acpi_status status;
+	u8 buf[SMRW_BUFFER_SIZE] = {};
+
+	buf[0] = SMRW_CMD_READ;
+	buf[1] = index;
+
+	param.type = ACPI_TYPE_BUFFER;
+	param.buffer.length = sizeof(buf);
+	param.buffer.pointer = buf;
+
+	input.count = 1;
+	input.pointer = &param;
+
+	status = acpi_evaluate_integer(data->handle, "SMRW", &input, &output);
+	if (ACPI_FAILURE(status))
+		return -EIO;
+
+	*val = output & 0xFF;
+
+	return 0;
+}
+
+/*
+ * Try to override hardcoded TDP limits with dynamic values from SMRW.
+ *
+ * Only overrides a limit if the returned value passes the firmware's
+ * own validation rules (value in range and not 0xFF). Values outside
+ * these ranges indicate the firmware does not provide that limit.
+ */
+static int uniwill_smrw_read_tdp_limits(struct uniwill_data *data)
+{
+	u8 pl1, pl2, pl4;
+	unsigned int pl4_effective;
+	int ret;
+
+	ret = uniwill_smrw_read(data, SMRW_INDEX_PL1, &pl1);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_smrw_read(data, SMRW_INDEX_PL2, &pl2);
+	if (ret < 0)
+		return ret;
+
+	ret = uniwill_smrw_read(data, SMRW_INDEX_PL4, &pl4);
+	if (ret < 0)
+		return ret;
+
+	if (pl1 != 0xFF && pl1 >= 15 && pl1 <= 253)
+		data->tdp_max[0] = pl1;
+
+	if (pl2 != 0xFF && pl2 >= 15 && pl2 <= 253)
+		data->tdp_max[1] = pl2;
+
+	if (pl4 != 0xFF && pl4 >= 15 && pl4 <= 250) {
+		pl4_effective = pl4;
+		if (data->has_double_pl4)
+			pl4_effective *= 2;
+
+		data->tdp_max[2] = pl4_effective;
+	}
+
+	dev_info(data->dev,
+		 "SMRW dynamic TDP limits: PL1=%u PL2=%u PL4=%u\n",
+		 data->tdp_max[0], data->tdp_max[1], data->tdp_max[2]);
+
+	return 0;
+}
+
+/*
+ * Read GPU power limits from SMRW and store them for runtime use.
+ *
+ * Index 4: cTGP offset max (watts) - upper bound for ctgp_offset sysfs
+ * Index 5: Dynamic Boost max (watts) - used by nvidia_ctgp_init
+ * Index 7: TGP base (watts) - base GPU power, exposed read-only
+ */
+static void uniwill_smrw_read_gpu_limits(struct uniwill_data *data)
+{
+	u8 val;
+	int ret;
+
+	ret = uniwill_smrw_read(data, SMRW_INDEX_CTGP_MAX, &val);
+	if (ret == 0 && val != 0xFF && val > 0)
+		data->ctgp_max = val;
+
+	ret = uniwill_smrw_read(data, SMRW_INDEX_DB_MAX, &val);
+	if (ret == 0 && val != 0xFF && val > 0)
+		data->db_max = val;
+
+	ret = uniwill_smrw_read(data, SMRW_INDEX_TGP_BASE, &val);
+	if (ret == 0 && val != 0xFF && val > 0)
+		data->tgp_base = val;
+
+	dev_info(data->dev,
+		 "SMRW GPU limits: cTGP_max=%u DB_max=%u TGP_base=%u\n",
+		 data->ctgp_max, data->db_max, data->tgp_base);
+}
+
 static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 {
 	unsigned int value;
@@ -1301,6 +1457,27 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 		return ret;
 
 	data->has_double_pl4 = !!(value & BIT(7));
+
+	/*
+	 * Try to read dynamic TDP limits from the ACPI SMRW method.
+	 *
+	 * The SMRW method provides a per-device configuration table
+	 * populated by the firmware. If valid values are returned,
+	 * they override the hardcoded per-device limits since the
+	 * firmware knows the exact capabilities of the hardware.
+	 *
+	 * SMRW takes a 13-byte buffer: byte 0 = 0xBB (read command),
+	 * byte 1 = index into the config table. It returns a dword
+	 * whose LSB contains the config value.
+	 *
+	 * Table layout:
+	 *   Index 0: PL1 max (watts)
+	 *   Index 1: PL2 max (watts)
+	 *   Index 2: PL4 max (raw; doubled if has_double_pl4)
+	 */
+	ret = uniwill_smrw_read_tdp_limits(data);
+	if (ret < 0)
+		dev_dbg(data->dev, "SMRW dynamic TDP read unavailable: %d\n", ret);
 
 	return 0;
 }
@@ -1640,6 +1817,9 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_breathing_in_suspend.attr,
 	/* Power-management-related */
 	&dev_attr_ctgp_offset.attr,
+	&dev_attr_ctgp_offset_max.attr,
+	&dev_attr_db_offset_max.attr,
+	&dev_attr_tgp_base.attr,
 	&dev_attr_dynamic_boost_enable.attr,
 	&dev_attr_cpu_pl1.attr,
 	&dev_attr_cpu_pl1_min.attr,
@@ -1686,6 +1866,24 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 
 	if (attr == &dev_attr_ctgp_offset.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_ctgp_offset_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
+		    data->ctgp_max)
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_db_offset_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
+		    data->db_max)
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_tgp_base.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
+		    data->tgp_base)
 			return attr->mode;
 	}
 
@@ -3758,6 +3956,8 @@ static int uniwill_probe(struct platform_device *pdev)
 	ret = uniwill_hwmon_init(data);
 	if (ret < 0)
 		return ret;
+
+	uniwill_smrw_read_gpu_limits(data);
 
 	ret = uniwill_nvidia_ctgp_init(data);
 	if (ret < 0)
