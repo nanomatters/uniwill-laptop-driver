@@ -156,6 +156,14 @@
 #define EC_ADDR_CUSTOM_PROFILE		0x0727
 #define CUSTOM_PROFILE_MODE		BIT(6)
 
+/* Per-mode default PL values (set by firmware, read-only) */
+#define EC_ADDR_PL1_DEFAULT_GAMING	0x0730
+#define EC_ADDR_PL2_DEFAULT_GAMING	0x0731
+#define EC_ADDR_PL4_DEFAULT_GAMING	0x0732
+#define EC_ADDR_PL1_DEFAULT_OFFICE	0x0734
+#define EC_ADDR_PL2_DEFAULT_OFFICE	0x0735
+#define EC_ADDR_PL4_DEFAULT_OFFICE	0x0736
+
 #define EC_ADDR_AP_OEM			0x0741
 #define	ENABLE_MANUAL_CTRL		BIT(0)
 #define ITE_KBD_EFFECT_REACTIVE		BIT(3)
@@ -459,6 +467,8 @@ struct uniwill_data {
 	bool has_double_pl4;
 	unsigned int tdp_min[3];
 	unsigned int tdp_max[3];
+	/* Per-profile default PL values read from EC firmware registers */
+	unsigned int tdp_defaults[3][3];	/* [profile_idx][pl_idx] */
 	unsigned int fan_mode;		/* 0=full-speed, 1=manual, 2=auto */
 	unsigned int last_fan_pwm[2];	/* Saved PWM values per fan for suspend/resume */
 	bool boost_active;		/* True when EC is in boost (FAN_MODE_BOOST) mode */
@@ -562,8 +572,8 @@ static const struct key_entry uniwill_keymap[] = {
 	{ KE_IGNORE,    UNIWILL_OSD_RADIOON,                    { KEY_UNKNOWN }},
 	{ KE_IGNORE,    UNIWILL_OSD_RADIOOFF,                   { KEY_UNKNOWN }},
 
-	/* Reported when user wants to cycle the platform profile */
-	{ KE_KEY,       UNIWILL_OSD_PERFORMANCE_MODE_TOGGLE,    { KEY_F14 }},
+	/* Handled in notifier to cycle the platform profile directly */
+	{ KE_IGNORE,    UNIWILL_OSD_PERFORMANCE_MODE_TOGGLE,    { KEY_UNKNOWN }},
 
 	/* Reported when the user wants to adjust the brightness of the keyboard */
 	{ KE_KEY,       UNIWILL_OSD_KBDILLUMDOWN,               { KEY_KBDILLUMDOWN }},
@@ -758,6 +768,12 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_LIGHTBAR_BAT_BLUE:
 	case EC_ADDR_SYSTEM_ID:
 	case EC_ADDR_CUSTOM_PROFILE:
+	case EC_ADDR_PL1_DEFAULT_GAMING:
+	case EC_ADDR_PL2_DEFAULT_GAMING:
+	case EC_ADDR_PL4_DEFAULT_GAMING:
+	case EC_ADDR_PL1_DEFAULT_OFFICE:
+	case EC_ADDR_PL2_DEFAULT_OFFICE:
+	case EC_ADDR_PL4_DEFAULT_OFFICE:
 	case EC_ADDR_CTGP_DB_CTRL:
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
@@ -1618,6 +1634,55 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	ret = uniwill_smrw_read_tdp_limits(data);
 	if (ret < 0)
 		dev_dbg(data->dev, "SMRW dynamic TDP read unavailable: %d\n", ret);
+
+	/*
+	 * Read per-profile default PL values from EC firmware registers.
+	 * These are set by the firmware and define the PL1/PL2/PL4 values
+	 * that should be applied when switching between profiles.
+	 *
+	 * Profile 0 = Quiet (Office): EC 0x0734-0x0736
+	 * Profile 1 = Balanced (Gaming): EC 0x0730-0x0732
+	 * Profile 2 = Performance (Turbo): 0 = use BIOS default (max)
+	 */
+	ret = regmap_read(data->regmap, EC_ADDR_PL1_DEFAULT_OFFICE, &value);
+	if (ret < 0)
+		return ret;
+	data->tdp_defaults[0][0] = value;
+
+	ret = regmap_read(data->regmap, EC_ADDR_PL2_DEFAULT_OFFICE, &value);
+	if (ret < 0)
+		return ret;
+	data->tdp_defaults[0][1] = value;
+
+	ret = regmap_read(data->regmap, EC_ADDR_PL4_DEFAULT_OFFICE, &value);
+	if (ret < 0)
+		return ret;
+	data->tdp_defaults[0][2] = value;
+
+	ret = regmap_read(data->regmap, EC_ADDR_PL1_DEFAULT_GAMING, &value);
+	if (ret < 0)
+		return ret;
+	data->tdp_defaults[1][0] = value;
+
+	ret = regmap_read(data->regmap, EC_ADDR_PL2_DEFAULT_GAMING, &value);
+	if (ret < 0)
+		return ret;
+	data->tdp_defaults[1][1] = value;
+
+	ret = regmap_read(data->regmap, EC_ADDR_PL4_DEFAULT_GAMING, &value);
+	if (ret < 0)
+		return ret;
+	data->tdp_defaults[1][2] = value;
+
+	/* Performance (Turbo) mode: 0 means "use BIOS default" (max limits) */
+	data->tdp_defaults[2][0] = 0;
+	data->tdp_defaults[2][1] = 0;
+	data->tdp_defaults[2][2] = 0;
+
+	dev_dbg(data->dev, "TDP defaults: quiet=%u/%u/%u gaming=%u/%u/%u\n",
+		data->tdp_defaults[0][0], data->tdp_defaults[0][1],
+		data->tdp_defaults[0][2], data->tdp_defaults[1][0],
+		data->tdp_defaults[1][1], data->tdp_defaults[1][2]);
 
 	return 0;
 }
@@ -3320,24 +3385,62 @@ static int uniwill_profile_get(struct device *dev, enum platform_profile_option 
 	}
 }
 
+static int uniwill_write_pl_values(struct uniwill_data *data, int profile_idx)
+{
+	unsigned int pl4_val;
+	int ret;
+
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL))
+		return 0;
+
+	ret = regmap_write(data->regmap, EC_ADDR_PL1_SETTING,
+			   data->tdp_defaults[profile_idx][0]);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_write(data->regmap, EC_ADDR_PL2_SETTING,
+			   data->tdp_defaults[profile_idx][1]);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * Some devices store half the PL4 value in the EC register.
+	 * Apply the halving when writing profile defaults.
+	 */
+	pl4_val = data->tdp_defaults[profile_idx][2];
+	if (data->has_double_pl4 && pl4_val)
+		pl4_val /= 2;
+
+	return regmap_write(data->regmap, EC_ADDR_PL4_SETTING, pl4_val);
+}
+
 static int uniwill_profile_set(struct device *dev, enum platform_profile_option profile)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
+	int profile_idx;
+	int ret;
 
 	switch (profile) {
 	case PLATFORM_PROFILE_QUIET:
 		value = PROFILE_QUIET;
+		profile_idx = 0;
 		break;
 	case PLATFORM_PROFILE_BALANCED:
 		value = PROFILE_BALANCED;
+		profile_idx = 1;
 		break;
 	case PLATFORM_PROFILE_PERFORMANCE:
 		value = PROFILE_PERFORMANCE;
+		profile_idx = 2;
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
+
+	ret = uniwill_write_pl_values(data, profile_idx);
+	if (ret < 0)
+		return ret;
 
 	return regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 				  PROFILE_MODE_MASK, value);
@@ -3359,7 +3462,9 @@ static int uniwill_profile_init(struct uniwill_data *data)
 	/*
 	 * Initialize to balanced mode. This matches the tuxedo driver behavior
 	 * which resets EC_ADDR_MANUAL_FAN_CTRL to 0x00 during probe.
+	 * Also write the corresponding default PL values.
 	 */
+	uniwill_write_pl_values(data, 1);
 	regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 			   PROFILE_MODE_MASK, PROFILE_BALANCED);
 
@@ -4135,6 +4240,12 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 			return NOTIFY_DONE;
 
 		return notifier_from_errno(uniwill_notify_kbd_led(data, 4));
+	case UNIWILL_OSD_PERFORMANCE_MODE_TOGGLE:
+		if (data->num_profiles == 0)
+			return NOTIFY_DONE;
+
+		platform_profile_cycle();
+		return NOTIFY_OK;
 	default:
 		mutex_lock(&data->input_lock);
 		sparse_keymap_report_event(data->input_device, action, 1, true);
