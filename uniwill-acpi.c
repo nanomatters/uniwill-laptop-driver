@@ -319,6 +319,8 @@
 #define EC_ADDR_USB_C_POWER_PRIORITY	0x07CC
 #define USB_C_POWER_PRIORITY		BIT(7)
 
+#define EC_ADDR_GPU_POWER_ALLOC		0x07D5
+
 /* Same bits as EC_ADDR_LIGHTBAR_AC_CTRL except LIGHTBAR_S3_OFF */
 #define EC_ADDR_LIGHTBAR_BAT_CTRL	0x07E2
 
@@ -508,6 +510,7 @@ static const char * const uniwill_fan_labels[] = {
 
 static const char * const uniwill_power_labels[] = {
 	"System",
+	"GPU Allocation",
 };
 
 static const struct key_entry uniwill_keymap[] = {
@@ -739,6 +742,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 	case EC_ADDR_SYSTEM_POWER_LO:
 	case EC_ADDR_SYSTEM_POWER_HI:
+	case EC_ADDR_GPU_POWER_ALLOC:
 	case EC_ADDR_CPU_TEMP_END_TABLE ... EC_ADDR_CPU_TEMP_END_TABLE + 0xF:
 	case EC_ADDR_CPU_TEMP_START_TABLE ... EC_ADDR_CPU_TEMP_START_TABLE + 0xF:
 	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
@@ -777,6 +781,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 	case EC_ADDR_SYSTEM_POWER_LO:
 	case EC_ADDR_SYSTEM_POWER_HI:
+	case EC_ADDR_GPU_POWER_ALLOC:
 	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
 	case EC_ADDR_GPU_FAN_SPEED_TABLE ... EC_ADDR_GPU_FAN_SPEED_TABLE + 0xF:
 		return true;
@@ -2208,6 +2213,9 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		case 0: /* System power — needs GPU (discrete GPU implies full power monitoring) */
 			feature = UNIWILL_FEATURE_GPU_TEMP;
 			break;
+		case 1: /* GPU power allocation */
+			feature = UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL;
+			break;
 		default:
 			return 0;
 		}
@@ -2345,6 +2353,13 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 
 			/* hwmon power is in microwatts */
 			*val = (long)((value_hi << 8) | value) * 1000000;
+			return 0;
+		case 1: /* GPU power allocation (raw × 8 = watts) */
+			ret = regmap_read(data->regmap, EC_ADDR_GPU_POWER_ALLOC, &value);
+			if (ret < 0)
+				return ret;
+
+			*val = (long)value * 8 * 1000000;
 			return 0;
 		default:
 			return -EOPNOTSUPP;
@@ -2956,6 +2971,7 @@ static const struct hwmon_channel_info * const uniwill_info[] = {
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
 	HWMON_CHANNEL_INFO(power,
+			   HWMON_P_INPUT | HWMON_P_LABEL,
 			   HWMON_P_INPUT | HWMON_P_LABEL),
 	NULL
 };
@@ -2981,6 +2997,7 @@ static const struct hwmon_channel_info * const uniwill_info_wc[] = {
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
 	HWMON_CHANNEL_INFO(power,
+			   HWMON_P_INPUT | HWMON_P_LABEL,
 			   HWMON_P_INPUT | HWMON_P_LABEL),
 	NULL
 };
