@@ -303,3 +303,18 @@ Description:
 
 		This attribute is only available on devices with NVIDIA cTGP control support and
 		a valid SMRW table entry.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/vrm_current_limit
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Returns the current VRM (Voltage Regulator Module) current limit setting as an
+		unsigned integer, read from the EC.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/vrm_max_current_limit
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Returns the maximum VRM current limit as an unsigned integer, read from the EC.
