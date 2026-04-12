@@ -318,3 +318,15 @@ KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Returns the maximum VRM current limit as an unsigned integer, read from the EC.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/fan_switch_speed
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Controls the delay before fans ramp up to a new speed, in milliseconds.
+		Writing "0" disables the delay. Non-zero values are rounded to the nearest 100ms
+		and clamped to the range 100-12700ms.
+
+		Reading this file returns the current delay in milliseconds, or "0" if the
+		feature is disabled.
