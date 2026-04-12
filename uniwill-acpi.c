@@ -98,6 +98,9 @@
 
 #define EC_ADDR_MAIN_FAN_RPM_2		0x0465
 
+#define EC_ADDR_SYSTEM_POWER_LO		0x060C
+#define EC_ADDR_SYSTEM_POWER_HI		0x060D
+
 #define EC_ADDR_SCREEN_STATUS		0x0466
 #define SCREEN_SUSPENDED		BIT(6)
 
@@ -503,6 +506,10 @@ static const char * const uniwill_fan_labels[] = {
 	"Water Cooler Pump",
 };
 
+static const char * const uniwill_power_labels[] = {
+	"System",
+};
+
 static const struct key_entry uniwill_keymap[] = {
 	/* Reported via keyboard controller */
 	{ KE_IGNORE,    UNIWILL_OSD_CAPSLOCK,                   { KEY_CAPSLOCK }},
@@ -730,6 +737,8 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_MINI_LED_SUPPORT:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
+	case EC_ADDR_SYSTEM_POWER_LO:
+	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_CPU_TEMP_END_TABLE ... EC_ADDR_CPU_TEMP_END_TABLE + 0xF:
 	case EC_ADDR_CPU_TEMP_START_TABLE ... EC_ADDR_CPU_TEMP_START_TABLE + 0xF:
 	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
@@ -766,6 +775,8 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
+	case EC_ADDR_SYSTEM_POWER_LO:
+	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
 	case EC_ADDR_GPU_FAN_SPEED_TABLE ... EC_ADDR_GPU_FAN_SPEED_TABLE + 0xF:
 		return true;
@@ -2192,6 +2203,19 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		default:
 			return 0;
 		}
+	case hwmon_power:
+		switch (channel) {
+		case 0: /* System power — needs GPU (discrete GPU implies full power monitoring) */
+			feature = UNIWILL_FEATURE_GPU_TEMP;
+			break;
+		default:
+			return 0;
+		}
+
+		if (uniwill_device_supports(data, feature))
+			return 0444;
+
+		return 0;
 	default:
 		return 0;
 	}
@@ -2206,7 +2230,7 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 			long *val)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
-	unsigned int value;
+	unsigned int value, value_hi;
 	__be16 rpm;
 	int ret;
 
@@ -2308,6 +2332,23 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 		default:
 			return -EOPNOTSUPP;
 		}
+	case hwmon_power:
+		switch (channel) {
+		case 0: /* System total power (16-bit LE, watts) */
+			ret = regmap_read(data->regmap, EC_ADDR_SYSTEM_POWER_LO, &value);
+			if (ret < 0)
+				return ret;
+
+			ret = regmap_read(data->regmap, EC_ADDR_SYSTEM_POWER_HI, &value_hi);
+			if (ret < 0)
+				return ret;
+
+			/* hwmon power is in microwatts */
+			*val = (long)((value_hi << 8) | value) * 1000000;
+			return 0;
+		default:
+			return -EOPNOTSUPP;
+		}
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -2322,6 +2363,9 @@ static int uniwill_read_string(struct device *dev, enum hwmon_sensor_types type,
 		return 0;
 	case hwmon_fan:
 		*str = uniwill_fan_labels[channel];
+		return 0;
+	case hwmon_power:
+		*str = uniwill_power_labels[channel];
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -2911,6 +2955,8 @@ static const struct hwmon_channel_info * const uniwill_info[] = {
 	HWMON_CHANNEL_INFO(pwm,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+	HWMON_CHANNEL_INFO(power,
+			   HWMON_P_INPUT | HWMON_P_LABEL),
 	NULL
 };
 
@@ -2934,6 +2980,8 @@ static const struct hwmon_channel_info * const uniwill_info_wc[] = {
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+	HWMON_CHANNEL_INFO(power,
+			   HWMON_P_INPUT | HWMON_P_LABEL),
 	NULL
 };
 
