@@ -385,6 +385,8 @@
 #define UNIWILL_FEATURE_CPU_TDP_CONTROL		BIT(15)
 #define UNIWILL_FEATURE_WATER_COOLER		BIT(16)
 
+#define WC_STALE_TIMEOUT_MS	5000
+
 enum usb_c_power_priority_options {
 	USB_C_POWER_PRIORITY_CHARGING = 0,
 	USB_C_POWER_PRIORITY_PERFORMANCE,
@@ -438,6 +440,18 @@ struct uniwill_data {
 	bool has_mini_led_dimming;
 	bool mini_led_dimming_state;
 	bool dynamic_boost_enable;
+	/* Water cooler tunnel state */
+	struct {
+		struct mutex lock;	/* Protects all water cooler fields */
+		unsigned long last_update;	/* jiffies of last daemon write */
+		unsigned int fan_rpm;		/* Actual fan RPM from daemon */
+		unsigned int pump_rpm;		/* Actual pump RPM from daemon */
+		u8 fan_pwm;			/* Actual fan PWM from daemon (0-255) */
+		u8 pump_pwm;			/* Actual pump PWM from daemon (0-255) */
+		u8 fan_pwm_target;		/* Target fan PWM set via hwmon (0-255) */
+		u8 pump_pwm_target;		/* Target pump PWM set via hwmon (0-255) */
+		unsigned int fan_mode;		/* 0=full, 1=manual, 2=auto */
+	} wc;
 };
 
 struct uniwill_battery_entry {
@@ -482,6 +496,8 @@ static const char * const uniwill_temp_labels[] = {
 static const char * const uniwill_fan_labels[] = {
 	"Main",
 	"Secondary",
+	"Water Cooler Fan",
+	"Water Cooler Pump",
 };
 
 static const struct key_entry uniwill_keymap[] = {
@@ -1730,8 +1746,186 @@ static const struct attribute_group uniwill_group = {
 	.attrs = uniwill_attrs,
 };
 
+/* Water cooler sysfs bridge attributes */
+
+static ssize_t wc_fan_rpm_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int rpm;
+
+	mutex_lock(&data->wc.lock);
+	rpm = data->wc.fan_rpm;
+	mutex_unlock(&data->wc.lock);
+	return sysfs_emit(buf, "%u\n", rpm);
+}
+
+static ssize_t wc_fan_rpm_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int rpm;
+
+	if (kstrtouint(buf, 10, &rpm))
+		return -EINVAL;
+
+	mutex_lock(&data->wc.lock);
+	data->wc.fan_rpm = rpm;
+	data->wc.last_update = jiffies;
+	mutex_unlock(&data->wc.lock);
+	return count;
+}
+
+static ssize_t wc_pump_rpm_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int rpm;
+
+	mutex_lock(&data->wc.lock);
+	rpm = data->wc.pump_rpm;
+	mutex_unlock(&data->wc.lock);
+	return sysfs_emit(buf, "%u\n", rpm);
+}
+
+static ssize_t wc_pump_rpm_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int rpm;
+
+	if (kstrtouint(buf, 10, &rpm))
+		return -EINVAL;
+
+	mutex_lock(&data->wc.lock);
+	data->wc.pump_rpm = rpm;
+	data->wc.last_update = jiffies;
+	mutex_unlock(&data->wc.lock);
+	return count;
+}
+
+static ssize_t wc_fan_pwm_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	u8 pwm;
+
+	mutex_lock(&data->wc.lock);
+	pwm = data->wc.fan_pwm;
+	mutex_unlock(&data->wc.lock);
+	return sysfs_emit(buf, "%u\n", pwm);
+}
+
+static ssize_t wc_fan_pwm_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int pwm;
+
+	if (kstrtouint(buf, 10, &pwm) || pwm > U8_MAX)
+		return -EINVAL;
+
+	mutex_lock(&data->wc.lock);
+	data->wc.fan_pwm = pwm;
+	data->wc.last_update = jiffies;
+	mutex_unlock(&data->wc.lock);
+	return count;
+}
+
+static ssize_t wc_pump_pwm_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	u8 pwm;
+
+	mutex_lock(&data->wc.lock);
+	pwm = data->wc.pump_pwm;
+	mutex_unlock(&data->wc.lock);
+	return sysfs_emit(buf, "%u\n", pwm);
+}
+
+static ssize_t wc_pump_pwm_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int pwm;
+
+	if (kstrtouint(buf, 10, &pwm) || pwm > U8_MAX)
+		return -EINVAL;
+
+	mutex_lock(&data->wc.lock);
+	data->wc.pump_pwm = pwm;
+	data->wc.last_update = jiffies;
+	mutex_unlock(&data->wc.lock);
+	return count;
+}
+
+static ssize_t wc_fan_pwm_target_show(struct device *dev, struct device_attribute *attr,
+				      char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	u8 target;
+
+	mutex_lock(&data->wc.lock);
+	target = data->wc.fan_pwm_target;
+	mutex_unlock(&data->wc.lock);
+	return sysfs_emit(buf, "%u\n", target);
+}
+
+static ssize_t wc_pump_pwm_target_show(struct device *dev, struct device_attribute *attr,
+				       char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	u8 target;
+
+	mutex_lock(&data->wc.lock);
+	target = data->wc.pump_pwm_target;
+	mutex_unlock(&data->wc.lock);
+	return sysfs_emit(buf, "%u\n", target);
+}
+
+static ssize_t wc_fan_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->wc.fan_mode);
+}
+
+static DEVICE_ATTR_RW(wc_fan_rpm);
+static DEVICE_ATTR_RW(wc_pump_rpm);
+static DEVICE_ATTR_RW(wc_fan_pwm);
+static DEVICE_ATTR_RW(wc_pump_pwm);
+static DEVICE_ATTR_RO(wc_fan_pwm_target);
+static DEVICE_ATTR_RO(wc_pump_pwm_target);
+static DEVICE_ATTR_RO(wc_fan_mode);
+
+static struct attribute *uniwill_wc_attrs[] = {
+	&dev_attr_wc_fan_rpm.attr,
+	&dev_attr_wc_pump_rpm.attr,
+	&dev_attr_wc_fan_pwm.attr,
+	&dev_attr_wc_pump_pwm.attr,
+	&dev_attr_wc_fan_pwm_target.attr,
+	&dev_attr_wc_pump_pwm_target.attr,
+	&dev_attr_wc_fan_mode.attr,
+	NULL
+};
+
+static umode_t uniwill_wc_is_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
+		return attr->mode;
+
+	return 0;
+}
+
+static const struct attribute_group uniwill_wc_group = {
+	.name = "water_cooler",
+	.is_visible = uniwill_wc_is_visible,
+	.attrs = uniwill_wc_attrs,
+};
+
 static const struct attribute_group *uniwill_groups[] = {
 	&uniwill_group,
+	&uniwill_wc_group,
 	NULL
 };
 
@@ -1762,6 +1956,10 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		case 1:
 			feature = UNIWILL_FEATURE_SECONDARY_FAN;
 			break;
+		case 2:
+		case 3:
+			feature = UNIWILL_FEATURE_WATER_COOLER;
+			break;
 		default:
 			return 0;
 		}
@@ -1774,6 +1972,10 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		case 1:
 			feature = UNIWILL_FEATURE_SECONDARY_FAN;
 			break;
+		case 2:
+		case 3:
+			feature = UNIWILL_FEATURE_WATER_COOLER;
+			break;
 		default:
 			return 0;
 		}
@@ -1785,7 +1987,8 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		case hwmon_pwm_enable:
 			return 0644;
 		case hwmon_pwm_input:
-			if (data->has_universal_fan_ctrl)
+			if (data->has_universal_fan_ctrl ||
+			    channel >= 2)
 				return 0644;
 			return 0444;
 		default:
@@ -1837,6 +2040,18 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 			ret = regmap_bulk_read(data->regmap, EC_ADDR_SECOND_FAN_RPM_1, &rpm,
 					       sizeof(rpm));
 			break;
+		case 2:
+		case 3:
+			mutex_lock(&data->wc.lock);
+			if (data->wc.last_update == 0 ||
+			    time_after(jiffies, data->wc.last_update +
+				       msecs_to_jiffies(WC_STALE_TIMEOUT_MS)))
+				*val = 0;
+			else
+				*val = (channel == 2) ? data->wc.fan_rpm
+						      : data->wc.pump_rpm;
+			mutex_unlock(&data->wc.lock);
+			return 0;
 		default:
 			return -EOPNOTSUPP;
 		}
@@ -1849,9 +2064,20 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 	case hwmon_pwm:
 		switch (attr) {
 		case hwmon_pwm_enable:
+			if (channel >= 2) {
+				*val = data->wc.fan_mode;
+				return 0;
+			}
 			*val = data->fan_mode;
 			return 0;
 		case hwmon_pwm_input:
+			if (channel >= 2) {
+				mutex_lock(&data->wc.lock);
+				*val = (channel == 2) ? data->wc.fan_pwm
+						      : data->wc.pump_pwm;
+				mutex_unlock(&data->wc.lock);
+				return 0;
+			}
 			/*
 			 * When boost is active, the EC reports 0xFF in the
 			 * PWM status register. Return the last value written
@@ -2146,8 +2372,30 @@ static int uniwill_write(struct device *dev, enum hwmon_sensor_types type, u32 a
 	case hwmon_pwm:
 		switch (attr) {
 		case hwmon_pwm_enable:
+			if (channel >= 2) {
+				if (val < 0 || val > 2)
+					return -EINVAL;
+				data->wc.fan_mode = val;
+				sysfs_notify(&data->dev->kobj, "water_cooler",
+					     "fan_mode");
+				return 0;
+			}
 			return uniwill_set_fan_mode(data, val);
 		case hwmon_pwm_input:
+			if (channel >= 2) {
+				if (val < 0 || val > U8_MAX)
+					return -EINVAL;
+				mutex_lock(&data->wc.lock);
+				if (channel == 2)
+					data->wc.fan_pwm_target = val;
+				else
+					data->wc.pump_pwm_target = val;
+				mutex_unlock(&data->wc.lock);
+				sysfs_notify(&data->dev->kobj, "water_cooler",
+					     (channel == 2) ? "fan_pwm_target"
+							    : "pump_pwm_target");
+				return 0;
+			}
 			return uniwill_set_pwm(data, channel, val);
 		default:
 			return -EOPNOTSUPP;
@@ -2473,18 +2721,48 @@ static const struct hwmon_chip_info uniwill_chip_info = {
 	.info = uniwill_info,
 };
 
+static const struct hwmon_channel_info * const uniwill_info_wc[] = {
+	HWMON_CHANNEL_INFO(chip, HWMON_C_REGISTER_TZ),
+	HWMON_CHANNEL_INFO(temp,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL),
+	HWMON_CHANNEL_INFO(fan,
+			   HWMON_F_INPUT | HWMON_F_LABEL,
+			   HWMON_F_INPUT | HWMON_F_LABEL,
+			   HWMON_F_INPUT | HWMON_F_LABEL,
+			   HWMON_F_INPUT | HWMON_F_LABEL),
+	HWMON_CHANNEL_INFO(pwm,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+	NULL
+};
+
+static const struct hwmon_chip_info uniwill_chip_info_wc = {
+	.ops = &uniwill_ops,
+	.info = uniwill_info_wc,
+};
+
 static int uniwill_hwmon_init(struct uniwill_data *data)
 {
+	const struct hwmon_chip_info *chip_info;
 	struct device *hdev;
 
 	if (!uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TEMP) &&
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_GPU_TEMP) &&
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN) &&
-	    !uniwill_device_supports(data, UNIWILL_FEATURE_SECONDARY_FAN))
+	    !uniwill_device_supports(data, UNIWILL_FEATURE_SECONDARY_FAN) &&
+	    !uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
 		return 0;
 
+	if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
+		chip_info = &uniwill_chip_info_wc;
+	else
+		chip_info = &uniwill_chip_info;
+
 	hdev = devm_hwmon_device_register_with_info(data->dev, "uniwill", data,
-						    &uniwill_chip_info,
+						    chip_info,
 						    uniwill_auto_point_groups);
 
 	return PTR_ERR_OR_ZERO(hdev);
@@ -3432,6 +3710,14 @@ static int uniwill_probe(struct platform_device *pdev)
 	/* Auto-detect universal fan control support */
 	data->has_universal_fan_ctrl = uniwill_has_universal_fan_ctrl(data);
 	data->fan_mode = 2;
+
+	/* Initialise water cooler tunnel state */
+	if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER)) {
+		ret = devm_mutex_init(&pdev->dev, &data->wc.lock);
+		if (ret < 0)
+			return ret;
+		data->wc.fan_mode = 2;
+	}
 
 	/*
 	 * Initialise the fan curve tables with sensible defaults so that
