@@ -202,3 +202,70 @@ Description:
 		This attribute is only available on devices with a mini LED display which supports
 		local dimming. The current state cannot be read from hardware, so reading this file
 		returns the last written value.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_fan_rpm
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Bridge attribute for water cooler fan speed reporting. A userspace daemon
+		writes the current fan RPM value obtained from the water cooler hardware.
+
+		Reading this file returns the last reported fan RPM value.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_pump_rpm
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Bridge attribute for water cooler pump speed reporting. A userspace daemon
+		writes the current pump RPM value obtained from the water cooler hardware.
+
+		Reading this file returns the last reported pump RPM value.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_fan_pwm
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Bridge attribute for water cooler fan PWM duty cycle. A userspace daemon
+		writes the current fan PWM value (0-255) obtained from the water cooler
+		hardware. The value is also mirrored to the EC liquid cooling fan duty register.
+
+		Reading this file returns the last reported fan PWM value.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_pump_pwm
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Bridge attribute for water cooler pump PWM duty cycle. A userspace daemon
+		writes the current pump PWM value (0-255) obtained from the water cooler
+		hardware. The value is also mirrored to the EC liquid cooling pump duty register.
+
+		Reading this file returns the last reported pump PWM value.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_fan_pwm_target
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Returns the target fan PWM value (0-255) as computed by the driver fan curve
+		logic. A userspace daemon reads this to apply the target to the water cooler
+		hardware.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_pump_pwm_target
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Returns the target pump PWM value (0-255) as computed by the driver fan curve
+		logic. A userspace daemon reads this to apply the target to the water cooler
+		hardware.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_fan_mode
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Returns the current water cooler fan control mode as an unsigned integer.
