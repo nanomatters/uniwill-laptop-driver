@@ -21,6 +21,7 @@
 #include <linux/device.h>
 #include <linux/device/driver.h>
 #include <linux/dmi.h>
+#include <linux/efi.h>
 #include <linux/errno.h>
 #include <linux/fixp-arith.h>
 #include <linux/hwmon.h>
@@ -357,6 +358,7 @@
 #define UNIWILL_EC_DELAY_US	6000
 
 #define PWM_MAX			200
+#define FAN_ON_MIN_SPEED_PERCENT	25
 #define FAN_TABLE_LENGTH	16
 
 #define LED_CHANNELS		3
@@ -456,6 +458,7 @@ struct uniwill_device_descriptor {
 	 */
 	unsigned int tdp_min[3];
 	unsigned int tdp_max[3];
+	bool has_hidden_bios_options;
 	/* Executed during driver probing */
 	int (*probe)(struct uniwill_data *data);
 };
@@ -1285,6 +1288,114 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	return 0;
 }
 
+/*
+ * Hidden BIOS options.
+ *
+ * Some devices store overclocking/performance switches in an EFI variable
+ * ("OemMagicVariable") but hide them from the user in the BIOS setup UI.
+ * Enabling them simply makes those options visible in BIOS setup.
+ */
+
+#define EFI_OEM_MAGIC_MEM_OC_SWITCH	0x33
+#define EFI_OEM_MAGIC_MEM_OC_SUPPORT	0x60
+#define EFI_OEM_MAGIC_CPU_OC_SUPPORT	0x6E
+#define EFI_OEM_MAGIC_CPU_OC_SWITCH	0x6F
+
+static efi_guid_t oem_magic_guid =
+	EFI_GUID(0x9f33f85c, 0x13ca, 0x4fd1,
+		 0x9c, 0x4a, 0x96, 0x21, 0x77, 0x22, 0xc5, 0x93);
+
+static void uniwill_show_hidden_bios_options(struct uniwill_data *data)
+{
+	efi_char16_t name[] = L"OemMagicVariable";
+	unsigned long size = 0;
+	bool changed = false;
+	efi_status_t st;
+	u8 *buf = NULL;
+	u32 attr = 0;
+	u8 b1, b2;
+
+	if (!efi_enabled(EFI_RUNTIME_SERVICES)) {
+		dev_warn(data->dev,
+			 "hidden_bios_options: EFI runtime services not available\n");
+		return;
+	}
+
+	st = efi.get_variable(name, &oem_magic_guid, &attr, &size, NULL);
+	if (st != EFI_BUFFER_TOO_SMALL) {
+		dev_err(data->dev,
+			"hidden_bios_options: get_variable probe failed: st=0x%lx\n",
+			(unsigned long)st);
+		return;
+	}
+
+	if (size <= EFI_OEM_MAGIC_CPU_OC_SWITCH) {
+		dev_err(data->dev,
+			"hidden_bios_options: EFI variable too small (%lu bytes)\n",
+			size);
+		return;
+	}
+
+	buf = kmalloc(size, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	st = efi.get_variable(name, &oem_magic_guid, &attr, &size, buf);
+	if (st != EFI_SUCCESS) {
+		dev_err(data->dev,
+			"hidden_bios_options: get_variable read failed: st=0x%lx\n",
+			(unsigned long)st);
+		goto out;
+	}
+
+	if (buf[EFI_OEM_MAGIC_MEM_OC_SUPPORT] != 0x01 ||
+	    buf[EFI_OEM_MAGIC_CPU_OC_SUPPORT] != 0x01) {
+		dev_warn(data->dev,
+			 "hidden_bios_options: support bits not set (mem=0x%02x cpu=0x%02x)\n",
+			 buf[EFI_OEM_MAGIC_MEM_OC_SUPPORT],
+			 buf[EFI_OEM_MAGIC_CPU_OC_SUPPORT]);
+		goto out;
+	}
+
+	b1 = buf[EFI_OEM_MAGIC_MEM_OC_SWITCH];
+	b2 = buf[EFI_OEM_MAGIC_CPU_OC_SWITCH];
+
+	if (!((b1 == 0x00 || b1 == 0x01) && (b2 == 0x00 || b2 == 0x01))) {
+		dev_err(data->dev,
+			"hidden_bios_options: unexpected byte values mem=0x%02x cpu=0x%02x\n",
+			b1, b2);
+		goto out;
+	}
+
+	if (b1 == 0x00) {
+		buf[EFI_OEM_MAGIC_MEM_OC_SWITCH] = 0x01;
+		changed = true;
+	}
+
+	if (b2 == 0x00) {
+		buf[EFI_OEM_MAGIC_CPU_OC_SWITCH] = 0x01;
+		changed = true;
+	}
+
+	if (!changed) {
+		dev_dbg(data->dev, "hidden_bios_options: already enabled\n");
+		goto out;
+	}
+
+	st = efi.set_variable(name, &oem_magic_guid, attr, size, buf);
+	if (st != EFI_SUCCESS) {
+		dev_warn(data->dev,
+			 "hidden_bios_options: set_variable failed: st=0x%lx\n",
+			 (unsigned long)st);
+		goto out;
+	}
+
+	dev_info(data->dev, "hidden_bios_options: enabled hidden BIOS options\n");
+
+out:
+	kfree(buf);
+}
+
 static const char * const USB_C_POWER_PRIORITY_TEXT[] = {
 	[USB_C_POWER_PRIORITY_CHARGING]		= "charging",
 	[USB_C_POWER_PRIORITY_PERFORMANCE]	= "performance",
@@ -1960,7 +2071,7 @@ static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
 
 static int uniwill_set_pwm(struct uniwill_data *data, int channel, long val)
 {
-	unsigned int ec_val;
+	unsigned int ec_val, fan_min;
 	int ret, i;
 
 	if (data->fan_mode != 1)
@@ -1970,6 +2081,18 @@ static int uniwill_set_pwm(struct uniwill_data *data, int channel, long val)
 		return -EINVAL;
 
 	ec_val = fixp_linear_interpolate(0, 0, U8_MAX, PWM_MAX, val);
+
+	/*
+	 * Enforce minimum fan-on speed. Values below half the minimum
+	 * threshold are treated as fan-off (0); values between half-min
+	 * and min are snapped up to the minimum on-speed to prevent
+	 * the fan from stalling.
+	 */
+	fan_min = FAN_ON_MIN_SPEED_PERCENT * PWM_MAX / 100;
+	if (ec_val < fan_min / 2)
+		ec_val = 0;
+	else if (ec_val < fan_min)
+		ec_val = fan_min;
 
 	data->last_fan_pwm[channel] = ec_val;
 
@@ -3357,6 +3480,9 @@ static int uniwill_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
+	if (device_descriptor.has_hidden_bios_options)
+		uniwill_show_hidden_bios_options(data);
+
 	ret = uniwill_profile_init(data);
 	if (ret < 0)
 		return ret;
@@ -3975,14 +4101,17 @@ static struct uniwill_device_descriptor gm7ixxn_descriptor __initdata = {
 /* TUXEDO Stellaris 16 Gen7 Intel (X6AR5xxY / X6AR5xxY_mLED) */
 static struct uniwill_device_descriptor x6ar5xxy_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 5, 5, 5 },
 	.tdp_max = { 210, 210, 420 },
+	.has_hidden_bios_options = true,
 };
 
 /* TUXEDO Stellaris 16 Gen7 AMD (X6FR5xxY) */
 static struct uniwill_device_descriptor x6fr5xxy_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
+	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 25, 25, 25 },
 	.tdp_max = { 162, 162, 195 },
@@ -4018,6 +4147,7 @@ static struct uniwill_device_descriptor x6ar55xu_descriptor __initdata = {
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 10, 10, 10 },
 	.tdp_max = { 145, 155, 290 },
+	.has_hidden_bios_options = true,
 };
 
 static int phxtxx1_probe(struct uniwill_data *data)
