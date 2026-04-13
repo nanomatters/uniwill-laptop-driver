@@ -277,6 +277,10 @@
 #define EC_ADDR_FAN_DEFAULT		0x0786
 #define FAN_CURVE_LENGTH		5
 
+#define EC_ADDR_FAN_SWITCH_SPEED	0x0787
+#define FAN_SWITCH_SPEED_ENABLE		BIT(7)
+#define FAN_SWITCH_SPEED_DELAY_MASK	GENMASK(6, 0)
+
 #define EC_ADDR_THERMAL_BUDGET		0x0788
 
 #define EC_ADDR_KBD_STATUS		0x078C
@@ -695,6 +699,7 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
+	case EC_ADDR_FAN_SWITCH_SPEED:
 	case EC_ADDR_CPU_TEMP_END_TABLE ... EC_ADDR_CPU_TEMP_END_TABLE + 0xF:
 	case EC_ADDR_CPU_TEMP_START_TABLE ... EC_ADDR_CPU_TEMP_START_TABLE + 0xF:
 	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
@@ -762,6 +767,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_GPU_POWER_ALLOC:
 	case EC_ADDR_THERMAL_BUDGET:
+	case EC_ADDR_FAN_SWITCH_SPEED:
 	case EC_ADDR_VRM_CURRENT_LIMIT:
 	case EC_ADDR_VRM_MAX_CURRENT_LIMIT:
 	case EC_ADDR_CPU_TEMP_END_TABLE ... EC_ADDR_CPU_TEMP_END_TABLE + 0xF:
@@ -1512,6 +1518,57 @@ static ssize_t vrm_max_current_limit_show(struct device *dev, struct device_attr
 
 static DEVICE_ATTR_RO(vrm_max_current_limit);
 
+static ssize_t fan_switch_speed_show(struct device *dev, struct device_attribute *attr,
+				     char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_FAN_SWITCH_SPEED, &value);
+	if (ret < 0)
+		return ret;
+
+	if (!(value & FAN_SWITCH_SPEED_ENABLE))
+		return sysfs_emit(buf, "0\n");
+
+	/* Delay is in 100ms units, report in milliseconds */
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)(value & FAN_SWITCH_SPEED_DELAY_MASK) * 100);
+}
+
+static ssize_t fan_switch_speed_store(struct device *dev, struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &value);
+	if (ret < 0)
+		return ret;
+
+	if (value == 0) {
+		ret = regmap_write(data->regmap, EC_ADDR_FAN_SWITCH_SPEED, 0);
+	} else {
+		/* Convert ms to 100ms units, clamp to 1-127 */
+		value = DIV_ROUND_CLOSEST(value, 100);
+		if (value < 1)
+			value = 1;
+		if (value > 127)
+			value = 127;
+		ret = regmap_write(data->regmap, EC_ADDR_FAN_SWITCH_SPEED,
+				   FAN_SWITCH_SPEED_ENABLE | value);
+	}
+
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(fan_switch_speed);
+
 static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 {
 	unsigned int value;
@@ -1909,6 +1966,7 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_mini_led_local_dimming.attr,
 	&dev_attr_vrm_current_limit.attr,
 	&dev_attr_vrm_max_current_limit.attr,
+	&dev_attr_fan_switch_speed.attr,
 	NULL
 };
 
@@ -2013,6 +2071,11 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 	if (attr == &dev_attr_vrm_current_limit.attr ||
 	    attr == &dev_attr_vrm_max_current_limit.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_fan_switch_speed.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN))
 			return attr->mode;
 	}
 
