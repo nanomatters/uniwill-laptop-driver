@@ -96,6 +96,9 @@
 #define EC_ADDR_SYSTEM_ID		0x0456
 #define HAS_GPU				BIT(7)
 
+#define EC_ADDR_CPU_TEMP_LIMIT		0x0463
+#define TEMP_LIMIT_TJMAX		105
+
 #define EC_ADDR_MAIN_FAN_RPM_1		0x0464
 
 #define EC_ADDR_MAIN_FAN_RPM_2		0x0465
@@ -747,6 +750,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_MINI_LED_SUPPORT:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 	case EC_ADDR_ADAPTER_CURRENT:
+	case EC_ADDR_CPU_TEMP_LIMIT:
 	case EC_ADDR_SYSTEM_POWER_LO:
 	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_GPU_POWER_ALLOC:
@@ -787,6 +791,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 	case EC_ADDR_ADAPTER_CURRENT:
+	case EC_ADDR_CPU_TEMP_LIMIT:
 	case EC_ADDR_SYSTEM_POWER_LO:
 	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_GPU_POWER_ALLOC:
@@ -2169,7 +2174,18 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		default:
 			return 0;
 		}
-		break;
+
+		if (!uniwill_device_supports(data, feature))
+			return 0;
+
+		switch (attr) {
+		case hwmon_temp_input:
+		case hwmon_temp_label:
+		case hwmon_temp_max:
+			return 0444;
+		default:
+			return 0;
+		}
 	case hwmon_fan:
 		switch (channel) {
 		case 0:
@@ -2265,22 +2281,37 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 
 	switch (type) {
 	case hwmon_temp:
-		switch (channel) {
-		case 0:
-			ret = regmap_read(data->regmap, EC_ADDR_CPU_TEMP, &value);
-			break;
-		case 1:
-			ret = regmap_read(data->regmap, EC_ADDR_GPU_TEMP, &value);
-			break;
+		switch (attr) {
+		case hwmon_temp_input:
+			switch (channel) {
+			case 0:
+				ret = regmap_read(data->regmap, EC_ADDR_CPU_TEMP, &value);
+				break;
+			case 1:
+				ret = regmap_read(data->regmap, EC_ADDR_GPU_TEMP, &value);
+				break;
+			default:
+				return -EOPNOTSUPP;
+			}
+
+			if (ret < 0)
+				return ret;
+
+			*val = value * MILLIDEGREE_PER_DEGREE;
+			return 0;
+		case hwmon_temp_max:
+			if (channel != 0)
+				return -EOPNOTSUPP;
+
+			ret = regmap_read(data->regmap, EC_ADDR_CPU_TEMP_LIMIT, &value);
+			if (ret < 0)
+				return ret;
+
+			*val = (long)(TEMP_LIMIT_TJMAX - value) * MILLIDEGREE_PER_DEGREE;
+			return 0;
 		default:
 			return -EOPNOTSUPP;
 		}
-
-		if (ret < 0)
-			return ret;
-
-		*val = value * MILLIDEGREE_PER_DEGREE;
-		return 0;
 	case hwmon_fan:
 		switch (channel) {
 		case 0:
@@ -2999,7 +3030,7 @@ static const struct hwmon_ops uniwill_ops = {
 static const struct hwmon_channel_info * const uniwill_info[] = {
 	HWMON_CHANNEL_INFO(chip, HWMON_C_REGISTER_TZ),
 	HWMON_CHANNEL_INFO(temp,
-			   HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_MAX,
 			   HWMON_T_INPUT | HWMON_T_LABEL),
 	HWMON_CHANNEL_INFO(fan,
 			   HWMON_F_INPUT | HWMON_F_LABEL,
@@ -3023,7 +3054,7 @@ static const struct hwmon_chip_info uniwill_chip_info = {
 static const struct hwmon_channel_info * const uniwill_info_wc[] = {
 	HWMON_CHANNEL_INFO(chip, HWMON_C_REGISTER_TZ),
 	HWMON_CHANNEL_INFO(temp,
-			   HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_MAX,
 			   HWMON_T_INPUT | HWMON_T_LABEL),
 	HWMON_CHANNEL_INFO(fan,
 			   HWMON_F_INPUT | HWMON_F_LABEL,
