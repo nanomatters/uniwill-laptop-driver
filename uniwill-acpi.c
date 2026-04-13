@@ -273,6 +273,8 @@
 #define EC_ADDR_FAN_DEFAULT		0x0786
 #define FAN_CURVE_LENGTH		5
 
+#define EC_ADDR_THERMAL_BUDGET		0x0788
+
 #define EC_ADDR_KBD_STATUS		0x078C
 #define KBD_WHITE_ONLY			BIT(0)
 #define KBD_POWER_OFF			BIT(1)
@@ -516,6 +518,7 @@ static const char * const uniwill_fan_labels[] = {
 static const char * const uniwill_power_labels[] = {
 	"System",
 	"GPU Allocation",
+	"Thermal Budget",
 };
 
 static const char * const uniwill_curr_labels[] = {
@@ -754,6 +757,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SYSTEM_POWER_LO:
 	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_GPU_POWER_ALLOC:
+	case EC_ADDR_THERMAL_BUDGET:
 	case EC_ADDR_CPU_TEMP_END_TABLE ... EC_ADDR_CPU_TEMP_END_TABLE + 0xF:
 	case EC_ADDR_CPU_TEMP_START_TABLE ... EC_ADDR_CPU_TEMP_START_TABLE + 0xF:
 	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
@@ -795,6 +799,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SYSTEM_POWER_LO:
 	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_GPU_POWER_ALLOC:
+	case EC_ADDR_THERMAL_BUDGET:
 	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
 	case EC_ADDR_GPU_FAN_SPEED_TABLE ... EC_ADDR_GPU_FAN_SPEED_TABLE + 0xF:
 		return true;
@@ -2240,6 +2245,9 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		case 1: /* GPU power allocation */
 			feature = UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL;
 			break;
+		case 2: /* Thermal budget */
+			feature = UNIWILL_FEATURE_GPU_TEMP;
+			break;
 		default:
 			return 0;
 		}
@@ -2408,6 +2416,13 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 			return 0;
 		case 1: /* GPU power allocation (raw × 8 = watts) */
 			ret = regmap_read(data->regmap, EC_ADDR_GPU_POWER_ALLOC, &value);
+			if (ret < 0)
+				return ret;
+
+			*val = (long)value * 8 * 1000000;
+			return 0;
+		case 2: /* Thermal budget remaining (raw × 8 = watts) */
+			ret = regmap_read(data->regmap, EC_ADDR_THERMAL_BUDGET, &value);
 			if (ret < 0)
 				return ret;
 
@@ -3040,6 +3055,7 @@ static const struct hwmon_channel_info * const uniwill_info[] = {
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
 	HWMON_CHANNEL_INFO(power,
 			   HWMON_P_INPUT | HWMON_P_LABEL,
+			   HWMON_P_INPUT | HWMON_P_LABEL,
 			   HWMON_P_INPUT | HWMON_P_LABEL),
 	HWMON_CHANNEL_INFO(curr,
 			   HWMON_C_INPUT | HWMON_C_LABEL),
@@ -3067,6 +3083,7 @@ static const struct hwmon_channel_info * const uniwill_info_wc[] = {
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
 	HWMON_CHANNEL_INFO(power,
+			   HWMON_P_INPUT | HWMON_P_LABEL,
 			   HWMON_P_INPUT | HWMON_P_LABEL,
 			   HWMON_P_INPUT | HWMON_P_LABEL),
 	HWMON_CHANNEL_INFO(curr,
