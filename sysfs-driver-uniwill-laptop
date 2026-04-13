@@ -269,3 +269,37 @@ KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Returns the current water cooler fan control mode as an unsigned integer.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/ctgp_offset_max
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Returns the maximum allowed configurable TGP (cTGP) offset in watts for this
+		device, as reported by the ACPI SMRW firmware table. This limits the value that
+		can be written to ctgp_offset.
+
+		This attribute is only available on devices with NVIDIA cTGP control support and
+		a valid SMRW table entry.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/db_offset_max
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Returns the maximum allowed NVIDIA Dynamic Boost offset in watts for this device,
+		as reported by the ACPI SMRW firmware table.
+
+		This attribute is only available on devices with NVIDIA cTGP control support and
+		a valid SMRW table entry.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/tgp_base
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Returns the base Total Graphics Power (TGP) of the discrete GPU in watts, as
+		reported by the ACPI SMRW firmware table.
+
+		This attribute is only available on devices with NVIDIA cTGP control support and
+		a valid SMRW table entry.
