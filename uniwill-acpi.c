@@ -323,6 +323,9 @@
 #define CHARGE_CTRL_MASK		GENMASK(6, 0)
 #define CHARGE_CTRL_REACHED		BIT(7)
 
+#define EC_ADDR_CHARGE_CTRL_START	0x07D0
+#define CHARGE_CTRL_START_MASK		GENMASK(6, 0)
+
 #define EC_ADDR_UNIVERSAL_FAN_CTRL	0x07C5
 #define SPLIT_TABLES			BIT(7)
 
@@ -420,6 +423,8 @@ struct uniwill_data {
 	u8 project_id;
 	struct acpi_battery_hook hook;
 	unsigned int last_charge_ctrl;
+	bool has_charge_limit;
+	bool has_charge_start_threshold;
 	struct mutex battery_lock;	/* Protects the list of currently registered batteries */
 	unsigned int last_status;
 	unsigned int last_switch_status;
@@ -504,6 +509,10 @@ struct uniwill_device_descriptor {
 static bool force;
 module_param_unsafe(force, bool, 0);
 MODULE_PARM_DESC(force, "Force loading without checking for supported devices\n");
+
+static bool allow_charge_limit;
+module_param(allow_charge_limit, bool, 0444);
+MODULE_PARM_DESC(allow_charge_limit, "Allow writing to the charge control threshold register (default: false)");
 
 /*
  * Contains device specific data like the feature bitmap since
@@ -742,6 +751,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_KBD_STATUS:
 	case EC_ADDR_OEM_4:
 	case EC_ADDR_CHARGE_CTRL:
+	case EC_ADDR_CHARGE_CTRL_START:
 	case EC_ADDR_LIGHTBAR_BAT_CTRL:
 	case EC_ADDR_LIGHTBAR_BAT_RED:
 	case EC_ADDR_LIGHTBAR_BAT_GREEN:
@@ -805,6 +815,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_CHARGE_CTRL:
+	case EC_ADDR_CHARGE_CTRL_START:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 	case EC_ADDR_ADAPTER_CURRENT:
 	case EC_ADDR_CPU_TEMP_LIMIT:
@@ -3814,6 +3825,18 @@ static int uniwill_get_property(struct power_supply *psy, const struct power_sup
 			val->intval = min(regval, 100);
 
 		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		ret = regmap_read(data->regmap, EC_ADDR_CHARGE_CTRL_START, &regval);
+		if (ret < 0)
+			return ret;
+
+		regval = FIELD_GET(CHARGE_CTRL_START_MASK, regval);
+		if (!regval)
+			val->intval = 0;
+		else
+			val->intval = min(regval, 100);
+
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -3861,8 +3884,9 @@ static int uniwill_property_is_writeable(struct power_supply *psy,
 {
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CHARGE_TYPES:
-	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 		return true;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		return allow_charge_limit;
 	default:
 		return false;
 	}
@@ -3877,6 +3901,21 @@ static const struct power_supply_ext uniwill_charge_limit_extension = {
 	.name = DRIVER_NAME,
 	.properties = uniwill_charge_limit_properties,
 	.num_properties = ARRAY_SIZE(uniwill_charge_limit_properties),
+	.get_property = uniwill_get_property,
+	.set_property = uniwill_set_property,
+	.property_is_writeable = uniwill_property_is_writeable,
+};
+
+static const enum power_supply_property uniwill_charge_limit_start_properties[] = {
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
+};
+
+static const struct power_supply_ext uniwill_charge_limit_start_extension = {
+	.name = DRIVER_NAME,
+	.properties = uniwill_charge_limit_start_properties,
+	.num_properties = ARRAY_SIZE(uniwill_charge_limit_start_properties),
 	.get_property = uniwill_get_property,
 	.set_property = uniwill_set_property,
 	.property_is_writeable = uniwill_property_is_writeable,
@@ -3909,12 +3948,19 @@ static int uniwill_add_battery(struct power_supply *battery, struct acpi_battery
 	if (!entry)
 		return -ENOMEM;
 
-	if (uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
-		ret = power_supply_register_extension(battery, &uniwill_charge_limit_extension,
-						      data->dev, data);
-	else
+	if (data->has_charge_limit) {
+		if (data->has_charge_start_threshold)
+			ret = power_supply_register_extension(battery,
+							      &uniwill_charge_limit_start_extension,
+							      data->dev, data);
+		else
+			ret = power_supply_register_extension(battery,
+							      &uniwill_charge_limit_extension,
+							      data->dev, data);
+	} else {
 		ret = power_supply_register_extension(battery, &uniwill_charge_modes_extension,
 						      data->dev, data);
+	}
 
 	if (ret < 0) {
 		kfree(entry);
@@ -3944,10 +3990,16 @@ static int uniwill_remove_battery(struct power_supply *battery, struct acpi_batt
 		}
 	}
 
-	if (uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
-		power_supply_unregister_extension(battery, &uniwill_charge_limit_extension);
-	else
+	if (data->has_charge_limit) {
+		if (data->has_charge_start_threshold)
+			power_supply_unregister_extension(battery,
+							  &uniwill_charge_limit_start_extension);
+		else
+			power_supply_unregister_extension(battery,
+							  &uniwill_charge_limit_extension);
+	} else {
 		power_supply_unregister_extension(battery, &uniwill_charge_modes_extension);
+	}
 
 	return 0;
 }
@@ -3957,27 +4009,53 @@ static int uniwill_battery_init(struct uniwill_data *data)
 	unsigned int value, threshold;
 	int ret;
 
-	if (uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT)) {
-		ret = regmap_read(data->regmap, EC_ADDR_CHARGE_CTRL, &value);
-		if (ret < 0)
-			return ret;
+	/*
+	 * Auto-detect charge limit support by checking whether the charge
+	 * control register contains a reasonable initial value. The ACPI
+	 * _BST method validates this same register (CGLM at 0x7B9)
+	 * unconditionally, confirming it exists across all INOU device
+	 * generations. A valid threshold is in the range 0-100, with 100
+	 * being the factory default ("no limit") and 0 meaning the register
+	 * is uninitialized but present.
+	 */
+	ret = regmap_read(data->regmap, EC_ADDR_CHARGE_CTRL, &value);
+	if (ret < 0)
+		return ret;
+
+	threshold = FIELD_GET(CHARGE_CTRL_MASK, value);
+	if (threshold <= 100) {
+		data->has_charge_limit = true;
 
 		/*
-		 * The charge control threshold might be initialized with 0 by
-		 * the EC to signal that said threshold is uninitialized. We thus
-		 * need to replace this value with 100 to signal that we want to
-		 * take control of battery charging. For the sake of completeness
-		 * we also set the charging threshold to 100 if the EC-provided
-		 * value is invalid.
+		 * When writing is enabled, initialize an uninitialized
+		 * threshold (0) to 100 to signal that we want to take
+		 * control of battery charging.
 		 */
-		threshold = FIELD_GET(CHARGE_CTRL_MASK, value);
-		if (threshold == 0 || threshold > 100) {
+		if (allow_charge_limit && threshold == 0) {
 			FIELD_MODIFY(CHARGE_CTRL_MASK, &value, 100);
 			ret = regmap_write(data->regmap, EC_ADDR_CHARGE_CTRL, value);
 			if (ret < 0)
 				return ret;
 		}
-	} else {
+
+		/*
+		 * Probe the charge start threshold register (read-only).
+		 * The register only exists on newer ECs that support
+		 * dual-threshold charge control. On older ECs 0x07D0
+		 * may be unmapped (returning 0xFF) or uninitialized
+		 * (returning 0x00). A valid start threshold is in the
+		 * range 1-100.
+		 */
+		ret = regmap_read(data->regmap, EC_ADDR_CHARGE_CTRL_START, &value);
+		if (ret < 0)
+			return ret;
+
+		threshold = FIELD_GET(CHARGE_CTRL_START_MASK, value);
+		if (threshold >= 1 && threshold <= 100)
+			data->has_charge_start_threshold = true;
+	}
+
+	if (!data->has_charge_limit) {
 		if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_MODES))
 			return 0;
 	}
@@ -4001,7 +4079,7 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 
 	switch (action) {
 	case UNIWILL_OSD_BATTERY_ALERT:
-		if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT) &&
+		if (!data->has_charge_limit &&
 		    !uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_MODES))
 			return NOTIFY_DONE;
 
@@ -4165,6 +4243,9 @@ static int uniwill_probe(struct platform_device *pdev)
 	memcpy(data->tdp_min, device_descriptor.tdp_min, sizeof(data->tdp_min));
 	memcpy(data->tdp_max, device_descriptor.tdp_max, sizeof(data->tdp_max));
 
+	if (uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
+		allow_charge_limit = true;
+
 	/* Auto-detect mini LED local dimming support */
 	data->has_mini_led_dimming = uniwill_has_mini_led_dimming(data);
 
@@ -4281,12 +4362,12 @@ static int uniwill_suspend_super_key(struct uniwill_data *data)
 
 static int uniwill_suspend_battery(struct uniwill_data *data)
 {
-	if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
+	if (!data->has_charge_limit || !allow_charge_limit)
 		return 0;
 
 	/*
 	 * Save the current charge limit in order to restore it during resume.
-	 * We cannot use the regmap code for that since this register needs to
+	 * We cannot use the regmap code for that since the register needs to
 	 * be declared as volatile due to CHARGE_CTRL_REACHED.
 	 */
 	return regmap_read(data->regmap, EC_ADDR_CHARGE_CTRL, &data->last_charge_ctrl);
@@ -4454,7 +4535,7 @@ static int uniwill_resume_super_key(struct uniwill_data *data)
 
 static int uniwill_resume_battery(struct uniwill_data *data)
 {
-	if (!uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
+	if (!data->has_charge_limit || !allow_charge_limit)
 		return 0;
 
 	return regmap_update_bits(data->regmap, EC_ADDR_CHARGE_CTRL, CHARGE_CTRL_MASK,
