@@ -89,6 +89,8 @@
 
 #define EC_ADDR_CPU_TEMP		0x043E
 
+#define EC_ADDR_ADAPTER_CURRENT		0x0449
+
 #define EC_ADDR_GPU_TEMP		0x044F
 
 #define EC_ADDR_SYSTEM_ID		0x0456
@@ -513,6 +515,10 @@ static const char * const uniwill_power_labels[] = {
 	"GPU Allocation",
 };
 
+static const char * const uniwill_curr_labels[] = {
+	"Adapter",
+};
+
 static const struct key_entry uniwill_keymap[] = {
 	/* Reported via keyboard controller */
 	{ KE_IGNORE,    UNIWILL_OSD_CAPSLOCK,                   { KEY_CAPSLOCK }},
@@ -740,6 +746,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_MINI_LED_SUPPORT:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
+	case EC_ADDR_ADAPTER_CURRENT:
 	case EC_ADDR_SYSTEM_POWER_LO:
 	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_GPU_POWER_ALLOC:
@@ -779,6 +786,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
+	case EC_ADDR_ADAPTER_CURRENT:
 	case EC_ADDR_SYSTEM_POWER_LO:
 	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_GPU_POWER_ALLOC:
@@ -2224,6 +2232,19 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 			return 0444;
 
 		return 0;
+	case hwmon_curr:
+		switch (channel) {
+		case 0: /* Adapter current */
+			feature = UNIWILL_FEATURE_GPU_TEMP;
+			break;
+		default:
+			return 0;
+		}
+
+		if (uniwill_device_supports(data, feature))
+			return 0444;
+
+		return 0;
 	default:
 		return 0;
 	}
@@ -2364,6 +2385,19 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 		default:
 			return -EOPNOTSUPP;
 		}
+	case hwmon_curr:
+		switch (channel) {
+		case 0: /* Adapter current (raw ÷ 10 = amps) */
+			ret = regmap_read(data->regmap, EC_ADDR_ADAPTER_CURRENT, &value);
+			if (ret < 0)
+				return ret;
+
+			/* hwmon current is in milliamps; raw ÷ 10 = amps → raw × 100 = mA */
+			*val = (long)value * 100;
+			return 0;
+		default:
+			return -EOPNOTSUPP;
+		}
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -2381,6 +2415,9 @@ static int uniwill_read_string(struct device *dev, enum hwmon_sensor_types type,
 		return 0;
 	case hwmon_power:
 		*str = uniwill_power_labels[channel];
+		return 0;
+	case hwmon_curr:
+		*str = uniwill_curr_labels[channel];
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -2973,6 +3010,8 @@ static const struct hwmon_channel_info * const uniwill_info[] = {
 	HWMON_CHANNEL_INFO(power,
 			   HWMON_P_INPUT | HWMON_P_LABEL,
 			   HWMON_P_INPUT | HWMON_P_LABEL),
+	HWMON_CHANNEL_INFO(curr,
+			   HWMON_C_INPUT | HWMON_C_LABEL),
 	NULL
 };
 
@@ -2999,6 +3038,8 @@ static const struct hwmon_channel_info * const uniwill_info_wc[] = {
 	HWMON_CHANNEL_INFO(power,
 			   HWMON_P_INPUT | HWMON_P_LABEL,
 			   HWMON_P_INPUT | HWMON_P_LABEL),
+	HWMON_CHANNEL_INFO(curr,
+			   HWMON_C_INPUT | HWMON_C_LABEL),
 	NULL
 };
 
