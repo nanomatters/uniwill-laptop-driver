@@ -4204,6 +4204,33 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 			regmap_set_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
 					CUSTOM_PROFILE_MODE);
 
+		/*
+		 * Re-apply PL values on AC/DC change. The EC may reset them
+		 * to defaults when the power source changes.
+		 */
+		if (data->num_profiles > 0 &&
+		    uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL)) {
+			unsigned int fan_ctrl;
+
+			if (regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+					&fan_ctrl) == 0) {
+				int idx;
+
+				switch (fan_ctrl & PROFILE_MODE_MASK) {
+				case PROFILE_QUIET:
+					idx = 0;
+					break;
+				case PROFILE_PERFORMANCE:
+					idx = 2;
+					break;
+				default:
+					idx = 1;
+					break;
+				}
+				uniwill_write_pl_values(data, idx);
+			}
+		}
+
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_USB_C_POWER_PRIORITY))
 			return notifier_from_errno(usb_c_power_priority_restore(data));
 
