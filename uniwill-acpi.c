@@ -4747,7 +4747,22 @@ static int uniwill_resume_fan_mode(struct uniwill_data *data)
 	case 0:	/* Full speed - restore boost */
 		return regmap_set_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 				       FAN_MODE_BOOST);
-	case 1:	/* Manual - re-enable custom tables */
+	case 1:	/* Manual - re-write speed tables and re-enable custom tables */
+		/*
+		 * The fan speed table registers are volatile and lost during
+		 * sleep. Re-write the last user-set speeds for zone 0 before
+		 * re-enabling the custom table control bits.
+		 */
+		ret = regmap_write(data->regmap, EC_ADDR_CPU_FAN_SPEED_TABLE,
+				   data->last_fan_pwm[0]);
+		if (ret < 0)
+			return ret;
+
+		ret = regmap_write(data->regmap, EC_ADDR_GPU_FAN_SPEED_TABLE,
+				   data->last_fan_pwm[1]);
+		if (ret < 0)
+			return ret;
+
 		ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
 				      SPLIT_TABLES);
 		if (ret < 0)
