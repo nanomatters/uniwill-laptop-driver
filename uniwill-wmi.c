@@ -66,6 +66,44 @@ int uniwill_wmi_evaluate(u8 function, u32 arg)
 	return 0;
 }
 
+int uniwill_wmi_evaluate_result(u8 function, u32 arg, u32 *result)
+{
+	u8 buf[40] = {};
+	struct acpi_buffer input = { sizeof(buf), buf };
+	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *obj;
+	acpi_status status;
+
+	memcpy(&buf[0], &arg, sizeof(arg));
+	buf[5] = function;
+
+	status = wmi_evaluate_method(UNIWILL_WMI_MGMT_GUID_BC, 0, 0x04,
+				     &input, &output);
+	if (ACPI_FAILURE(status))
+		return -EIO;
+
+	obj = output.pointer;
+	if (!obj) {
+		return -ENODATA;
+	}
+
+	if (obj->type == ACPI_TYPE_INTEGER) {
+		*result = obj->integer.value;
+	} else if (obj->type == ACPI_TYPE_BUFFER && obj->buffer.length >= 4) {
+		memcpy(result, obj->buffer.pointer, sizeof(*result));
+	} else {
+		pr_debug("wmi_evaluate_result: unexpected ACPI type %d\n", obj->type);
+		kfree(obj);
+		return -EIO;
+	}
+
+	pr_debug("wmi_evaluate_result: func=%u arg=0x%x type=%d result=0x%x\n",
+		 function, arg, obj->type, *result);
+
+	kfree(obj);
+	return 0;
+}
+
 /*
  * Write a single byte to the EC RAM using WMI method 0x04.
  *
