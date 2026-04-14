@@ -356,3 +356,17 @@ Description:
 		brackets.
 
 		This attribute is only available on devices with a GPU MUX switch.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu_tcc_offset
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Controls the CPU thermal throttling temperature target via the EC TCC register.
+		The value is a temperature in degrees Celsius (0-127). Writing "0" disables the
+		TCC override; writing a non-zero value sets and enables it.
+
+		Reading this file returns the current temperature target, or "0" if the TCC
+		override is disabled.
+
+		This attribute is only available on devices with TCC offset support.
