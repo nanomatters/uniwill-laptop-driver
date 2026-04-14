@@ -4700,8 +4700,31 @@ static int uniwill_resume_usb_c_power_priority(struct uniwill_data *data)
 
 static int uniwill_resume_profile(struct uniwill_data *data)
 {
+	int profile_idx;
+	int ret;
+
 	if (data->num_profiles == 0)
 		return 0;
+
+	switch (data->last_fan_ctrl & PROFILE_MODE_MASK) {
+	case PROFILE_QUIET:
+		profile_idx = 0;
+		break;
+	case PROFILE_PERFORMANCE:
+		profile_idx = 2;
+		break;
+	default:
+		profile_idx = 1;
+		break;
+	}
+
+	/*
+	 * Re-apply PL values because the PL registers are volatile and the EC
+	 * resets them to defaults during sleep.
+	 */
+	ret = uniwill_write_pl_values(data, profile_idx);
+	if (ret < 0)
+		return ret;
 
 	return regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 				  PROFILE_MODE_MASK, data->last_fan_ctrl);
