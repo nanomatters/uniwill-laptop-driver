@@ -39,6 +39,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
+#include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/platform_profile.h>
 #include <linux/pm.h>
@@ -155,6 +156,14 @@
 
 #define EC_ADDR_CUSTOM_PROFILE		0x0727
 #define CUSTOM_PROFILE_MODE		BIT(6)
+
+#define EC_ADDR_GPU_MUX_MODE		0x072A
+#define GPU_MUX_MODE_HYBRID		0x00
+#define GPU_MUX_MODE_DGPU_DIRECT	0x01
+#define GPU_MUX_MODE_IGPU_ONLY		0x02
+
+/* OemMagicVariable UEFI variable field offset for display mode */
+#define OEM_MAGIC_DISPLAY_MODE_OFFSET	0x62
 
 /* Per-mode default PL values (set by firmware, read-only) */
 #define EC_ADDR_PL1_DEFAULT_GAMING	0x0730
@@ -415,6 +424,7 @@
 #define UNIWILL_FEATURE_USB_POWERSHARE		BIT(14)
 #define UNIWILL_FEATURE_CPU_TDP_CONTROL		BIT(15)
 #define UNIWILL_FEATURE_WATER_COOLER		BIT(16)
+#define UNIWILL_FEATURE_GPU_MUX			BIT(17)
 
 #define WC_STALE_TIMEOUT_MS	5000
 
@@ -474,6 +484,9 @@ struct uniwill_data {
 	bool boost_active;		/* True when EC is in boost (FAN_MODE_BOOST) mode */
 	bool has_mini_led_dimming;
 	bool mini_led_dimming_state;
+	bool has_dgpu_power;
+	struct mutex dgpu_power_lock;	/* Protects dGPU power toggle via WMI */
+	bool has_gpu_mux;
 	bool dynamic_boost_enable;
 	unsigned int ctgp_max;
 	unsigned int db_max;
@@ -707,6 +720,7 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_LIGHTBAR_BAT_GREEN:
 	case EC_ADDR_LIGHTBAR_BAT_BLUE:
 	case EC_ADDR_CUSTOM_PROFILE:
+	case EC_ADDR_GPU_MUX_MODE:
 	case EC_ADDR_CTGP_DB_CTRL:
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
@@ -2012,6 +2026,210 @@ static ssize_t mini_led_local_dimming_show(struct device *dev, struct device_att
 
 static DEVICE_ATTR_RW(mini_led_local_dimming);
 
+/*
+ * Check if an NVIDIA dGPU is present on the PCI bus.
+ *
+ * The DSDT DGPS() method checks PG00._STA() which starts in a stale state
+ * at boot (it only becomes correct after IGPS() has been used). Checking
+ * actual PCI device presence is reliable regardless of boot state.
+ */
+static bool uniwill_dgpu_is_on(void)
+{
+	struct pci_dev *pdev = NULL;
+
+	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_VGA << 8, pdev))) {
+		if (pdev->vendor == PCI_VENDOR_ID_NVIDIA) {
+			pci_dev_put(pdev);
+			return true;
+		}
+	}
+
+	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_3D << 8, pdev))) {
+		if (pdev->vendor == PCI_VENDOR_ID_NVIDIA) {
+			pci_dev_put(pdev);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static ssize_t dgpu_power_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", uniwill_dgpu_is_on() ? 1 : 0);
+}
+
+static ssize_t dgpu_power_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	u32 result;
+	bool enable, is_on;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	is_on = uniwill_dgpu_is_on();
+
+	/* Already in the requested state */
+	if (enable == is_on)
+		return count;
+
+	guard(mutex)(&data->dgpu_power_lock);
+
+	/* enable=true: power on dGPU (IGPS(0)), enable=false: power off dGPU (IGPS(1)) */
+	ret = uniwill_wmi_evaluate_result(UNIWILL_WMI_FUNC_IGPU_ONLY,
+					  enable ? UNIWILL_WMI_DGPU_ON :
+						   UNIWILL_WMI_DGPU_OFF,
+					  &result);
+	if (ret < 0)
+		return ret;
+
+	dev_dbg(dev, "dgpu_power %s: IGPS returned 0x%x\n",
+		enable ? "on" : "off", result);
+
+	/*
+	 * IGPS returns:
+	 *   0x00 = dGPU powered on successfully
+	 *   0x01 = dGPU powered off successfully
+	 *   0x02 = timeout waiting for GPU to enter D3
+	 *   0xAA = operation failed (power gate stale or already in state)
+	 *   0x55 = PCIe slot was already powered down
+	 */
+	if (result == 0x02)
+		return -ETIMEDOUT;
+
+	/* Verify the operation actually took effect */
+	if (enable != uniwill_dgpu_is_on())
+		return -EIO;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(dgpu_power);
+
+static ssize_t gpu_mux_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	const char *mode;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_GPU_MUX_MODE, &value);
+	if (ret < 0)
+		return ret;
+
+	switch (value) {
+	case GPU_MUX_MODE_HYBRID:
+		mode = "hybrid";
+		break;
+	case GPU_MUX_MODE_DGPU_DIRECT:
+		mode = "dgpu_direct";
+		break;
+	case GPU_MUX_MODE_IGPU_ONLY:
+		mode = "igpu_only";
+		break;
+	default:
+		mode = "unknown";
+		break;
+	}
+
+	return sysfs_emit(buf, "%s\n", mode);
+}
+
+static int uniwill_update_oem_display_mode(struct device *dev, u8 mode)
+{
+	efi_char16_t name[] = L"OemMagicVariable";
+	unsigned long size = 0;
+	efi_status_t st;
+	u8 *buf = NULL;
+	u32 attr = 0;
+	int ret = 0;
+
+	if (!efi_enabled(EFI_RUNTIME_SERVICES))
+		return -EOPNOTSUPP;
+
+	st = efi.get_variable(name, &oem_magic_guid, &attr, &size, NULL);
+	if (st != EFI_BUFFER_TOO_SMALL) {
+		dev_err(dev, "gpu_mux: get_variable probe failed: 0x%lx\n",
+			(unsigned long)st);
+		return -EIO;
+	}
+
+	if (size <= OEM_MAGIC_DISPLAY_MODE_OFFSET) {
+		dev_err(dev, "gpu_mux: OemMagicVariable too small (%lu bytes)\n", size);
+		return -EINVAL;
+	}
+
+	buf = kmalloc(size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	st = efi.get_variable(name, &oem_magic_guid, &attr, &size, buf);
+	if (st != EFI_SUCCESS) {
+		dev_err(dev, "gpu_mux: get_variable read failed: 0x%lx\n",
+			(unsigned long)st);
+		ret = -EIO;
+		goto out;
+	}
+
+	if (buf[OEM_MAGIC_DISPLAY_MODE_OFFSET] == mode)
+		goto out;
+
+	buf[OEM_MAGIC_DISPLAY_MODE_OFFSET] = mode;
+
+	st = efi.set_variable(name, &oem_magic_guid, attr, size, buf);
+	if (st != EFI_SUCCESS) {
+		dev_err(dev, "gpu_mux: set_variable failed: 0x%lx\n",
+			(unsigned long)st);
+		ret = -EIO;
+		goto out;
+	}
+
+out:
+	kfree(buf);
+	return ret;
+}
+
+static ssize_t gpu_mux_mode_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int mode;
+	unsigned int current_mode;
+	int ret;
+
+	if (sysfs_streq(buf, "hybrid"))
+		mode = GPU_MUX_MODE_HYBRID;
+	else if (sysfs_streq(buf, "dgpu_direct"))
+		mode = GPU_MUX_MODE_DGPU_DIRECT;
+	else if (sysfs_streq(buf, "igpu_only"))
+		mode = GPU_MUX_MODE_IGPU_ONLY;
+	else
+		return -EINVAL;
+
+	ret = regmap_read(data->regmap, EC_ADDR_GPU_MUX_MODE, &current_mode);
+	if (ret < 0)
+		return ret;
+
+	if (mode == current_mode)
+		return count;
+
+	ret = uniwill_update_oem_display_mode(dev, mode);
+	if (ret < 0)
+		return ret;
+
+	dev_info(dev, "GPU MUX mode set to %s (reboot required to take effect)\n",
+		 mode == GPU_MUX_MODE_HYBRID ? "hybrid" :
+		 mode == GPU_MUX_MODE_DGPU_DIRECT ? "dgpu_direct" : "igpu_only");
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(gpu_mux_mode);
+
 static struct attribute *uniwill_attrs[] = {
 	/* Keyboard-related */
 	&dev_attr_fn_lock.attr,
@@ -2043,6 +2261,9 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_vrm_current_limit.attr,
 	&dev_attr_vrm_max_current_limit.attr,
 	&dev_attr_fan_switch_speed.attr,
+	/* GPU-related */
+	&dev_attr_dgpu_power.attr,
+	&dev_attr_gpu_mux_mode.attr,
 	NULL
 };
 
@@ -2152,6 +2373,16 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 
 	if (attr == &dev_attr_fan_switch_speed.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_dgpu_power.attr) {
+		if (data->has_dgpu_power)
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_gpu_mux_mode.attr) {
+		if (data->has_gpu_mux)
 			return attr->mode;
 	}
 
@@ -3331,6 +3562,50 @@ static bool uniwill_has_universal_fan_ctrl(struct uniwill_data *data)
 	return !!(value & UNIVERSAL_FAN_CTRL);
 }
 
+/*
+ * Check if the firmware supports runtime dGPU power control (iGPU-only mode).
+ * Uses WMI WMBC method 0x04 with function 3 (SAC1=0x0300), sub-command 3.
+ * The firmware checks GFID != 0 (discrete GPU present) and IGPM == 1
+ * (iGPU-only power management enabled) before returning 0x55 (supported).
+ */
+static bool uniwill_has_dgpu_power(void)
+{
+	u32 result;
+	int ret;
+
+	if (!wmi_has_guid(UNIWILL_WMI_MGMT_GUID_BC))
+		return false;
+
+	ret = uniwill_wmi_evaluate_result(UNIWILL_WMI_FUNC_IGPU_ONLY,
+					  UNIWILL_WMI_DGPU_SUPPORT, &result);
+	if (ret < 0)
+		return false;
+
+	return result == UNIWILL_WMI_DGPU_POWER_ON;
+}
+
+/*
+ * Check if the firmware supports GPU MUX switching by reading the MUX mode
+ * register. A valid value (0 = hybrid, 1 = dGPU direct) indicates support.
+ * Systems without a MUX typically have 0xFF or don't have a dGPU at all.
+ */
+static bool uniwill_has_gpu_mux(struct uniwill_data *data)
+{
+	unsigned int value;
+	int ret;
+
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_GPU_TEMP))
+		return false;
+
+	ret = regmap_read(data->regmap, EC_ADDR_GPU_MUX_MODE, &value);
+	if (ret < 0)
+		return false;
+
+	return value == GPU_MUX_MODE_HYBRID ||
+	       value == GPU_MUX_MODE_DGPU_DIRECT ||
+	       value == GPU_MUX_MODE_IGPU_ONLY;
+}
+
 static int uniwill_mini_led_init(struct uniwill_data *data)
 {
 	int ret;
@@ -4387,6 +4662,18 @@ static int uniwill_probe(struct platform_device *pdev)
 	/* Auto-detect mini LED local dimming support */
 	data->has_mini_led_dimming = uniwill_has_mini_led_dimming(data);
 
+	/* Auto-detect dGPU power control and GPU MUX switching support */
+	if (uniwill_device_supports(data, UNIWILL_FEATURE_GPU_MUX)) {
+		data->has_dgpu_power = uniwill_has_dgpu_power();
+		if (data->has_dgpu_power) {
+			ret = devm_mutex_init(&pdev->dev, &data->dgpu_power_lock);
+			if (ret < 0)
+				return ret;
+		}
+
+		data->has_gpu_mux = uniwill_has_gpu_mux(data);
+	}
+
 	/* Auto-detect universal fan control support */
 	data->has_universal_fan_ctrl = uniwill_has_universal_fan_ctrl(data);
 	data->fan_mode = 2;
@@ -5133,7 +5420,8 @@ static struct uniwill_device_descriptor x6ar5xxy_descriptor __initdata = {
 /* TUXEDO Stellaris 16 Gen7 AMD (X6FR5xxY) */
 static struct uniwill_device_descriptor x6fr5xxy_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
-		    UNIWILL_FEATURE_WATER_COOLER,
+		    UNIWILL_FEATURE_WATER_COOLER |
+		    UNIWILL_FEATURE_GPU_MUX,
 	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 25, 25, 25 },
@@ -5742,8 +6030,9 @@ static int __init uniwill_init(void)
 	}
 
 	if (force) {
-		/* Assume that the device supports all features except the charge limit */
-		device_descriptor.features = UINT_MAX & ~UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT;
+		/* Assume that the device supports all features except the charge limit and GPU MUX */
+		device_descriptor.features = UINT_MAX & ~(UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT |
+							  UNIWILL_FEATURE_GPU_MUX);
 		/* Some models only support 3 brightness levels */
 		device_descriptor.kbd_led_max_brightness = 4;
 		/* Some models only support 36 brightness levels per color component */

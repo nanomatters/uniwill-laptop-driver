@@ -330,3 +330,29 @@ Description:
 
 		Reading this file returns the current delay in milliseconds, or "0" if the
 		feature is disabled.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/dgpu_power
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Controls the power state of the discrete NVIDIA GPU. Writing "1" powers the dGPU
+		on; writing "0" powers it off via WMI.
+
+		Reading this file returns "1" if the dGPU is present on the PCI bus, "0" otherwise.
+
+		This attribute is only available on devices with dGPU power control support.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/gpu_mux_mode
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Controls the GPU MUX switch mode. Writing one of "hybrid", "dgpu_direct", or
+		"igpu_only" configures the display output routing. The change takes effect after
+		a reboot. The new mode is persisted in an EFI variable.
+
+		Reading this file returns the available modes with the currently active one in
+		brackets.
+
+		This attribute is only available on devices with a GPU MUX switch.

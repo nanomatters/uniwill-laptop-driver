@@ -121,9 +121,20 @@
 
 /* WMI management interface */
 #define UNIWILL_WMI_MGMT_GUID_BC	"ABBC0F6F-8EA1-11D1-00A0-C90629100000"
+#define UNIWILL_WMI_FUNC_IGPU_ONLY	3
 #define UNIWILL_WMI_FUNC_FEATURE_TOGGLE	5
 #define UNIWILL_WMI_LOCAL_DIMMING_ON	0x0E
 #define UNIWILL_WMI_LOCAL_DIMMING_OFF	0x0D
+
+/* IGPU-only sub-commands (SA00 values for WMI_FUNC_IGPU_ONLY) */
+#define UNIWILL_WMI_DGPU_ON		0x00
+#define UNIWILL_WMI_DGPU_OFF		0x01
+#define UNIWILL_WMI_DGPU_STATUS		0x02
+#define UNIWILL_WMI_DGPU_SUPPORT	0x03
+
+/* DGPS return values */
+#define UNIWILL_WMI_DGPU_POWER_ON	0x55
+#define UNIWILL_WMI_DGPU_POWER_OFF	0xAA
 
 struct device;
 struct notifier_block;
@@ -131,6 +142,8 @@ struct notifier_block;
 int devm_uniwill_wmi_register_notifier(struct device *dev, struct notifier_block *nb);
 
 int uniwill_wmi_evaluate(u8 function, u32 arg);
+
+int uniwill_wmi_evaluate_result(u8 function, u32 arg, u32 *result);
 
 int uniwill_wmi_ec_write(u16 addr, u8 data);
 
