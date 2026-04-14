@@ -291,7 +291,11 @@
 
 #define EC_ADDR_PL4_SETTING		0x0785
 
-#define EC_ADDR_FAN_DEFAULT		0x0786
+#define EC_ADDR_TCC_OFFSET		0x0786
+#define TCC_OFFSET_VALUE_MASK		GENMASK(6, 0)
+#define TCC_OFFSET_ENABLE		BIT(7)
+#define TCC_OFFSET_MAX			63
+
 #define FAN_CURVE_LENGTH		5
 
 #define EC_ADDR_FAN_SWITCH_SPEED	0x0787
@@ -425,6 +429,7 @@
 #define UNIWILL_FEATURE_CPU_TDP_CONTROL		BIT(15)
 #define UNIWILL_FEATURE_WATER_COOLER		BIT(16)
 #define UNIWILL_FEATURE_GPU_MUX			BIT(17)
+#define UNIWILL_FEATURE_TCC_OFFSET		BIT(18)
 
 #define WC_STALE_TIMEOUT_MS	5000
 
@@ -487,6 +492,7 @@ struct uniwill_data {
 	bool has_dgpu_power;
 	struct mutex dgpu_power_lock;	/* Protects dGPU power toggle via WMI */
 	bool has_gpu_mux;
+	bool has_tcc_offset;
 	bool dynamic_boost_enable;
 	unsigned int ctgp_max;
 	unsigned int db_max;
@@ -728,6 +734,7 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL1_SETTING:
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
+	case EC_ADDR_TCC_OFFSET:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
@@ -795,6 +802,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL1_SETTING:
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
+	case EC_ADDR_TCC_OFFSET:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_FAN_CTRL:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
@@ -843,6 +851,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL1_SETTING:
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
+	case EC_ADDR_TCC_OFFSET:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_CHARGE_CTRL_START:
@@ -2027,6 +2036,67 @@ static ssize_t mini_led_local_dimming_show(struct device *dev, struct device_att
 static DEVICE_ATTR_RW(mini_led_local_dimming);
 
 /*
+ * CPU TCC (Thermal Control Circuit) offset.
+ *
+ * The TCC offset lowers the temperature at which the CPU begins thermal
+ * throttling. For example, with Tjunction_max = 100°C and a TCC offset
+ * of 10, throttling starts at 90°C.
+ *
+ * EC register 0x0786 layout (confirmed via DSDT APTC/APTN fields):
+ *   bits [6:0] = offset value in degrees Celsius (0-63)
+ *   bit  [7]   = enable (1 = offset active, 0 = disabled)
+ *
+ * Writing 0 disables the TCC offset entirely (clears enable bit).
+ * Writing a non-zero value sets the offset and enables it.
+ */
+static ssize_t cpu_tcc_offset_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_TCC_OFFSET, &value);
+	if (ret < 0)
+		return ret;
+
+	if (!(value & TCC_OFFSET_ENABLE))
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%u\n", (unsigned int)(value & TCC_OFFSET_VALUE_MASK));
+}
+
+static ssize_t cpu_tcc_offset_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int offset;
+	u8 value;
+	int ret;
+
+	ret = kstrtouint(buf, 10, &offset);
+	if (ret < 0)
+		return ret;
+
+	if (offset > TCC_OFFSET_MAX)
+		return -EINVAL;
+
+	if (offset == 0)
+		value = 0;
+	else
+		value = TCC_OFFSET_ENABLE | offset;
+
+	ret = regmap_write(data->regmap, EC_ADDR_TCC_OFFSET, value);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(cpu_tcc_offset);
+
+/*
  * Check if an NVIDIA dGPU is present on the PCI bus.
  *
  * The DSDT DGPS() method checks PG00._STA() which starts in a stale state
@@ -2253,6 +2323,7 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_cpu_pl4.attr,
 	&dev_attr_cpu_pl4_min.attr,
 	&dev_attr_cpu_pl4_max.attr,
+	&dev_attr_cpu_tcc_offset.attr,
 	&dev_attr_usb_c_power_priority.attr,
 	&dev_attr_ac_auto_boot.attr,
 	&dev_attr_usb_powershare_high.attr,
@@ -2342,6 +2413,11 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 	    attr == &dev_attr_cpu_pl4_max.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
 		    data->tdp_max[2])
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_cpu_tcc_offset.attr) {
+		if (data->has_tcc_offset)
 			return attr->mode;
 	}
 
@@ -4674,6 +4750,9 @@ static int uniwill_probe(struct platform_device *pdev)
 		data->has_gpu_mux = uniwill_has_gpu_mux(data);
 	}
 
+	/* TCC offset: gated behind descriptor flag, no runtime detection needed */
+	data->has_tcc_offset = uniwill_device_supports(data, UNIWILL_FEATURE_TCC_OFFSET);
+
 	/* Auto-detect universal fan control support */
 	data->has_universal_fan_ctrl = uniwill_has_universal_fan_ctrl(data);
 	data->fan_mode = 2;
@@ -5421,7 +5500,8 @@ static struct uniwill_device_descriptor x6ar5xxy_descriptor __initdata = {
 static struct uniwill_device_descriptor x6fr5xxy_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
 		    UNIWILL_FEATURE_WATER_COOLER |
-		    UNIWILL_FEATURE_GPU_MUX,
+		    UNIWILL_FEATURE_GPU_MUX |
+		    UNIWILL_FEATURE_TCC_OFFSET,
 	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 25, 25, 25 },
@@ -6032,7 +6112,8 @@ static int __init uniwill_init(void)
 	if (force) {
 		/* Assume that the device supports all features except the charge limit and GPU MUX */
 		device_descriptor.features = UINT_MAX & ~(UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT |
-							  UNIWILL_FEATURE_GPU_MUX);
+							  UNIWILL_FEATURE_GPU_MUX |
+							  UNIWILL_FEATURE_TCC_OFFSET);
 		/* Some models only support 3 brightness levels */
 		device_descriptor.kbd_led_max_brightness = 4;
 		/* Some models only support 36 brightness levels per color component */
