@@ -86,6 +86,9 @@ Description:
 
 		Reading this file returns the current PL1 value in watts.
 
+		Writes are only permitted when the performance (overboost) profile is active.
+		Attempting to write in other profiles returns -EACCES.
+
 What:		/sys/bus/platform/devices/INOU0000:XX/cpu_pl1_max
 Date:		April 2026
 KernelVersion:	7.3
@@ -102,6 +105,9 @@ Description:
 		watts. The acceptable range is device specific and is capped at the device-specific maximum reported by cpu_pl2_max.
 
 		Reading this file returns the current PL2 value in watts.
+
+		Writes are only permitted when the performance (overboost) profile is active.
+		Attempting to write in other profiles returns -EACCES.
 
 What:		/sys/bus/platform/devices/INOU0000:XX/cpu_pl2_max
 Date:		April 2026
@@ -120,6 +126,9 @@ Description:
 		value internally but the sysfs interface always operates in effective watts.
 
 		Reading this file returns the current PL4 value in watts.
+
+		Writes are only permitted when the performance (overboost) profile is active.
+		Attempting to write in other profiles returns -EACCES.
 
 What:		/sys/bus/platform/devices/INOU0000:XX/cpu_pl4_max
 Date:		April 2026
