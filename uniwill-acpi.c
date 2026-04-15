@@ -1472,6 +1472,7 @@ static int uniwill_smrw_read_tdp_limits(struct uniwill_data *data)
 {
 	u8 pl1, pl2, pl4;
 	unsigned int pl4_effective;
+	unsigned int old_max[3];
 	int ret;
 
 	ret = uniwill_smrw_read(data, SMRW_INDEX_PL1, &pl1);
@@ -1486,6 +1487,8 @@ static int uniwill_smrw_read_tdp_limits(struct uniwill_data *data)
 	if (ret < 0)
 		return ret;
 
+	memcpy(old_max, data->tdp_max, sizeof(old_max));
+
 	if (pl1 != 0xFF && pl1 >= 15 && pl1 <= 253)
 		data->tdp_max[0] = pl1;
 
@@ -1499,6 +1502,15 @@ static int uniwill_smrw_read_tdp_limits(struct uniwill_data *data)
 
 		data->tdp_max[2] = pl4_effective;
 	}
+
+	if (old_max[0] != data->tdp_max[0] ||
+	    old_max[1] != data->tdp_max[1] ||
+	    old_max[2] != data->tdp_max[2])
+		dev_warn(data->dev,
+			 "SMRW overrides hardcoded TDP max: PL1 %u->%u PL2 %u->%u PL4 %u->%u\n",
+			 old_max[0], data->tdp_max[0],
+			 old_max[1], data->tdp_max[1],
+			 old_max[2], data->tdp_max[2]);
 
 	dev_info(data->dev,
 		 "SMRW dynamic TDP limits: PL1=%u PL2=%u PL4=%u\n",
