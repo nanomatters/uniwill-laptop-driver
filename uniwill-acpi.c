@@ -5488,7 +5488,9 @@ static struct uniwill_device_descriptor gm7ixxn_descriptor __initdata = {
 /* TUXEDO Stellaris 16 Gen7 Intel (X6AR5xxY / X6AR5xxY_mLED) */
 static struct uniwill_device_descriptor x6ar5xxy_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
-		    UNIWILL_FEATURE_WATER_COOLER,
+		    UNIWILL_FEATURE_WATER_COOLER |
+		    UNIWILL_FEATURE_GPU_MUX |
+		    UNIWILL_FEATURE_TCC_OFFSET,
 	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
 	.tdp_min = { 5, 5, 5 },
