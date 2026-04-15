@@ -11,6 +11,9 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+/* Uncomment to enable VRM current limit override in overboost mode */
+/* #define UNIWILL_ENABLE_VRM_OVERRIDE */
+
 #include <linux/acpi.h>
 #include <linux/array_size.h>
 #include <linux/bits.h>
@@ -477,13 +480,16 @@ struct uniwill_data {
 	enum usb_c_power_priority_options last_usb_c_power_priority_option;
 	unsigned int num_profiles;
 	unsigned int last_fan_ctrl;
+	struct device *pprof_dev;	/* platform_profile class device */
 	bool custom_profile_mode_needed;
 	bool has_universal_fan_ctrl;
 	bool has_double_pl4;
 	unsigned int tdp_min[3];
 	unsigned int tdp_max[3];
 	/* Per-profile default PL values read from EC firmware registers */
-	unsigned int tdp_defaults[3][3];	/* [profile_idx][pl_idx] */
+	unsigned int tdp_defaults[4][3];	/* [profile_idx][pl_idx] */
+	bool overboost_active;		/* True when max-power (overboost) profile is active */
+	unsigned int vrm_saved;		/* VRM current limit before overboost */
 	unsigned int fan_mode;		/* 0=full-speed, 1=manual, 2=auto */
 	unsigned int last_fan_pwm[2];	/* Saved PWM values per fan for suspend/resume */
 	bool boost_active;		/* True when EC is in boost (FAN_MODE_BOOST) mode */
@@ -731,10 +737,12 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
 	case EC_ADDR_CTGP_DB_DB_OFFSET:
+	case EC_ADDR_OEM_3:
 	case EC_ADDR_PL1_SETTING:
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_TCC_OFFSET:
+	case EC_ADDR_VRM_CURRENT_LIMIT:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
@@ -799,6 +807,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
 	case EC_ADDR_CTGP_DB_DB_OFFSET:
+	case EC_ADDR_OEM_3:
 	case EC_ADDR_PL1_SETTING:
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
@@ -856,6 +865,9 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_CHARGE_CTRL_START:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
+	case EC_ADDR_OEM_3:
+	case EC_ADDR_VRM_CURRENT_LIMIT:
+	case EC_ADDR_VRM_MAX_CURRENT_LIMIT:
 	case EC_ADDR_ADAPTER_CURRENT:
 	case EC_ADDR_CPU_TEMP_LIMIT:
 	case EC_ADDR_SYSTEM_POWER_LO:
@@ -1709,10 +1721,20 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 		return ret;
 	data->tdp_defaults[1][2] = value;
 
-	/* Performance (Turbo) mode: 0 means "use BIOS default" (max limits) */
-	data->tdp_defaults[2][0] = 0;
-	data->tdp_defaults[2][1] = 0;
-	data->tdp_defaults[2][2] = 0;
+	/* Performance (Turbo) mode: midpoint between balanced and max values */
+	data->tdp_defaults[2][0] = (data->tdp_defaults[1][0] + data->tdp_max[0]) / 2;
+	data->tdp_defaults[2][1] = (data->tdp_defaults[1][1] + data->tdp_max[1]) / 2;
+	data->tdp_defaults[2][2] = (data->tdp_defaults[1][2] + data->tdp_max[2]) / 2;
+
+	/*
+	 * Overboost (max-power) profile: use the SMRW-reported maximums
+	 * if available, otherwise fall back to hardcoded descriptor limits.
+	 * These are written to the EC together with a raised VRM current
+	 * limit to unlock the full power envelope with liquid cooling.
+	 */
+	data->tdp_defaults[3][0] = data->tdp_max[0];
+	data->tdp_defaults[3][1] = data->tdp_max[1];
+	data->tdp_defaults[3][2] = data->tdp_max[2];
 
 	dev_dbg(data->dev, "TDP defaults: quiet=%u/%u/%u gaming=%u/%u/%u\n",
 		data->tdp_defaults[0][0], data->tdp_defaults[0][1],
@@ -3712,6 +3734,54 @@ static int uniwill_mini_led_init(struct uniwill_data *data)
 	return 0;
 }
 
+/*
+ * Enable or disable overboost mode by setting the OVERBOOST bit in the
+ * EC OEM_3 register and raising the VRM current limit to the maximum.
+ * This unlocks higher CPU power envelopes (e.g. 160W sustained with
+ * external liquid cooling vs 135W on air).
+ */
+static int uniwill_set_overboost(struct uniwill_data *data, bool enable)
+{
+	int ret;
+#ifdef UNIWILL_ENABLE_VRM_OVERRIDE
+	unsigned int vrm_max;
+#endif
+
+	ret = regmap_update_bits(data->regmap, EC_ADDR_OEM_3, OVERBOOST,
+				 enable ? OVERBOOST : 0);
+	if (ret < 0)
+		return ret;
+
+#ifdef UNIWILL_ENABLE_VRM_OVERRIDE
+	if (enable) {
+		/* Save current VRM limit and raise to maximum */
+		ret = regmap_read(data->regmap, EC_ADDR_VRM_CURRENT_LIMIT,
+				  &data->vrm_saved);
+		if (ret < 0)
+			return ret;
+
+		ret = regmap_read(data->regmap, EC_ADDR_VRM_MAX_CURRENT_LIMIT,
+				  &vrm_max);
+		if (ret < 0)
+			return ret;
+
+		ret = regmap_write(data->regmap, EC_ADDR_VRM_CURRENT_LIMIT,
+				   vrm_max);
+		if (ret < 0)
+			return ret;
+	} else {
+		/* Restore previous VRM current limit */
+		ret = regmap_write(data->regmap, EC_ADDR_VRM_CURRENT_LIMIT,
+				   data->vrm_saved);
+		if (ret < 0)
+			return ret;
+	}
+#endif
+
+	data->overboost_active = enable;
+	return 0;
+}
+
 static int uniwill_profile_probe(void *drvdata, unsigned long *choices)
 {
 	struct uniwill_data *data = drvdata;
@@ -3721,6 +3791,10 @@ static int uniwill_profile_probe(void *drvdata, unsigned long *choices)
 
 	if (data->num_profiles >= 3)
 		set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
+
+	if (data->num_profiles >= 3 &&
+	    uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
+		set_bit(PLATFORM_PROFILE_MAX_POWER, choices);
 
 	return 0;
 }
@@ -3740,7 +3814,10 @@ static int uniwill_profile_get(struct device *dev, enum platform_profile_option 
 		*profile = PLATFORM_PROFILE_QUIET;
 		return 0;
 	case PROFILE_PERFORMANCE:
-		*profile = PLATFORM_PROFILE_PERFORMANCE;
+		if (data->overboost_active)
+			*profile = PLATFORM_PROFILE_MAX_POWER;
+		else
+			*profile = PLATFORM_PROFILE_PERFORMANCE;
 		return 0;
 	default:
 		*profile = PLATFORM_PROFILE_BALANCED;
@@ -3797,16 +3874,46 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		value = PROFILE_PERFORMANCE;
 		profile_idx = 2;
 		break;
+	case PLATFORM_PROFILE_MAX_POWER:
+		value = PROFILE_PERFORMANCE;
+		profile_idx = 3;
+		break;
 	default:
 		return -EOPNOTSUPP;
 	}
+
+	/* Disable overboost when leaving max-power profile */
+	if (data->overboost_active && profile != PLATFORM_PROFILE_MAX_POWER) {
+		ret = uniwill_set_overboost(data, false);
+		if (ret < 0)
+			return ret;
+	}
+
+	/*
+	 * Set the fan/profile mode BEFORE writing PL values. The EC firmware
+	 * may ignore PL writes unless the target profile mode is active.
+	 * The tuxedo control center follows this same order.
+	 */
+	ret = regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+				 PROFILE_MODE_MASK, value);
+	if (ret < 0)
+		return ret;
+
+	/* Track EC mode for Fn key cycling logic */
+	data->last_fan_ctrl = value;
 
 	ret = uniwill_write_pl_values(data, profile_idx);
 	if (ret < 0)
 		return ret;
 
-	return regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-				  PROFILE_MODE_MASK, value);
+	/* Enable overboost after setting performance EC mode */
+	if (profile == PLATFORM_PROFILE_MAX_POWER && !data->overboost_active) {
+		ret = uniwill_set_overboost(data, true);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
 }
 
 static const struct platform_profile_ops uniwill_profile_ops = {
@@ -3814,6 +3921,53 @@ static const struct platform_profile_ops uniwill_profile_ops = {
 	.profile_get = uniwill_profile_get,
 	.profile_set = uniwill_profile_set,
 };
+
+/*
+ * Custom profile cycling that includes MAX_POWER in the rotation.
+ * The kernel's platform_profile_cycle() explicitly skips MAX_POWER
+ * and CUSTOM profiles, so we implement our own cycling logic for
+ * the Fn key handler.
+ */
+static int uniwill_profile_cycle(struct uniwill_data *data)
+{
+	enum platform_profile_option cur, next;
+	int ret;
+
+	ret = uniwill_profile_get(data->pprof_dev, &cur);
+	if (ret < 0)
+		return ret;
+
+	switch (cur) {
+	case PLATFORM_PROFILE_QUIET:
+		next = PLATFORM_PROFILE_BALANCED;
+		break;
+	case PLATFORM_PROFILE_BALANCED:
+		if (data->num_profiles >= 3)
+			next = PLATFORM_PROFILE_PERFORMANCE;
+		else
+			next = PLATFORM_PROFILE_QUIET;
+		break;
+	case PLATFORM_PROFILE_PERFORMANCE:
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
+			next = PLATFORM_PROFILE_MAX_POWER;
+		else
+			next = PLATFORM_PROFILE_QUIET;
+		break;
+	case PLATFORM_PROFILE_MAX_POWER:
+		next = PLATFORM_PROFILE_QUIET;
+		break;
+	default:
+		next = PLATFORM_PROFILE_BALANCED;
+		break;
+	}
+
+	ret = uniwill_profile_set(data->pprof_dev, next);
+	if (ret < 0)
+		return ret;
+
+	platform_profile_notify(data->pprof_dev);
+	return 0;
+}
 
 static int uniwill_profile_init(struct uniwill_data *data)
 {
@@ -3827,14 +3981,18 @@ static int uniwill_profile_init(struct uniwill_data *data)
 	 * which resets EC_ADDR_MANUAL_FAN_CTRL to 0x00 during probe.
 	 * Also write the corresponding default PL values.
 	 */
-	uniwill_write_pl_values(data, 1);
 	regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 			   PROFILE_MODE_MASK, PROFILE_BALANCED);
+	data->last_fan_ctrl = PROFILE_BALANCED;
+	uniwill_write_pl_values(data, 1);
 
 	pprof = devm_platform_profile_register(data->dev, "uniwill-platform-profile",
 					       data, &uniwill_profile_ops);
+	if (IS_ERR(pprof))
+		return PTR_ERR(pprof);
 
-	return PTR_ERR_OR_ZERO(pprof);
+	data->pprof_dev = pprof;
+	return 0;
 }
 
 static int uniwill_custom_profile_init(struct uniwill_data *data)
@@ -4584,13 +4742,15 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 					idx = 0;
 					break;
 				case PROFILE_PERFORMANCE:
-					idx = 2;
+					idx = data->overboost_active ? 3 : 2;
 					break;
 				default:
 					idx = 1;
 					break;
 				}
 				uniwill_write_pl_values(data, idx);
+				if (data->overboost_active)
+					uniwill_set_overboost(data, true);
 			}
 		}
 
@@ -4634,8 +4794,7 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 		if (data->num_profiles == 0)
 			return NOTIFY_DONE;
 
-		platform_profile_cycle();
-		return NOTIFY_OK;
+		return notifier_from_errno(uniwill_profile_cycle(data));
 	default:
 		mutex_lock(&data->input_lock);
 		sparse_keymap_report_event(data->input_device, action, 1, true);
@@ -5116,7 +5275,7 @@ static int uniwill_resume_profile(struct uniwill_data *data)
 		profile_idx = 0;
 		break;
 	case PROFILE_PERFORMANCE:
-		profile_idx = 2;
+		profile_idx = data->overboost_active ? 3 : 2;
 		break;
 	default:
 		profile_idx = 1;
@@ -5124,15 +5283,23 @@ static int uniwill_resume_profile(struct uniwill_data *data)
 	}
 
 	/*
-	 * Re-apply PL values because the PL registers are volatile and the EC
-	 * resets them to defaults during sleep.
+	 * Re-apply profile mode first, then PL values. The EC firmware
+	 * may only apply PL writes when the target profile is active.
 	 */
+	ret = regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+				 PROFILE_MODE_MASK, data->last_fan_ctrl);
+	if (ret < 0)
+		return ret;
+
 	ret = uniwill_write_pl_values(data, profile_idx);
 	if (ret < 0)
 		return ret;
 
-	return regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-				  PROFILE_MODE_MASK, data->last_fan_ctrl);
+	/* Re-apply overboost (VRM current + OVERBOOST bit) after resume */
+	if (data->overboost_active)
+		return uniwill_set_overboost(data, true);
+
+	return 0;
 }
 
 static int uniwill_resume_custom_profile(struct uniwill_data *data)
