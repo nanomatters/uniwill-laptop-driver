@@ -1245,6 +1245,9 @@ static ssize_t cpu_pl1_store(struct device *dev, struct device_attribute *attr,
 	unsigned int value;
 	int ret;
 
+	if (!data->overboost_active)
+		return -EACCES;
+
 	ret = kstrtouint(buf, 0, &value);
 	if (ret < 0)
 		return ret;
@@ -1291,6 +1294,9 @@ static ssize_t cpu_pl2_store(struct device *dev, struct device_attribute *attr,
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
 	int ret;
+
+	if (!data->overboost_active)
+		return -EACCES;
 
 	ret = kstrtouint(buf, 0, &value);
 	if (ret < 0)
@@ -1339,6 +1345,9 @@ static ssize_t cpu_pl4_store(struct device *dev, struct device_attribute *attr,
 	unsigned int value;
 	u8 ec_value;
 	int ret;
+
+	if (!data->overboost_active)
+		return -EACCES;
 
 	ret = kstrtouint(buf, 0, &value);
 	if (ret < 0)
