@@ -355,3 +355,12 @@ Description:
 		override is disabled.
 
 		This attribute is only available on devices with TCC offset support.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/ec_firmware_version
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Returns the EC firmware version as "major.minor" (e.g. "1.07").
+
+		Returns -ENODATA if the firmware version cannot be read.
