@@ -175,6 +175,9 @@
 #define EC_ADDR_PL1_DEFAULT_OFFICE	0x0734
 #define EC_ADDR_PL2_DEFAULT_OFFICE	0x0735
 #define EC_ADDR_PL4_DEFAULT_OFFICE	0x0736
+#define EC_ADDR_TCC_DEFAULT_GAMING	0x07D8
+#define EC_ADDR_TCC_DEFAULT_OFFICE	0x07D9
+#define EC_ADDR_TCC_DEFAULT_TURBO	0x07DA
 
 #define EC_ADDR_AP_OEM			0x0741
 #define	ENABLE_MANUAL_CTRL		BIT(0)
@@ -500,6 +503,7 @@ struct uniwill_data {
 	struct mutex dgpu_power_lock;	/* Protects dGPU power toggle via WMI */
 	bool has_gpu_mux;
 	bool has_tcc_offset;
+	unsigned int tcc_defaults[3];	/* [0]=quiet, [1]=balanced, [2]=performance */
 	bool dynamic_boost_enable;
 	unsigned int ctgp_max;
 	unsigned int db_max;
@@ -797,6 +801,9 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL1_DEFAULT_OFFICE:
 	case EC_ADDR_PL2_DEFAULT_OFFICE:
 	case EC_ADDR_PL4_DEFAULT_OFFICE:
+	case EC_ADDR_TCC_DEFAULT_GAMING:
+	case EC_ADDR_TCC_DEFAULT_OFFICE:
+	case EC_ADDR_TCC_DEFAULT_TURBO:
 	case EC_ADDR_CTGP_DB_CTRL:
 	case EC_ADDR_CTGP_DB_CTGP_OFFSET:
 	case EC_ADDR_CTGP_DB_TPP_OFFSET:
@@ -1707,6 +1714,21 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	data->tdp_defaults[3][0] = data->tdp_max[0];
 	data->tdp_defaults[3][1] = data->tdp_max[1];
 	data->tdp_defaults[3][2] = data->tdp_max[2];
+
+	if (data->has_tcc_offset) {
+		if (regmap_read(data->regmap, EC_ADDR_TCC_DEFAULT_OFFICE, &value) == 0)
+			data->tcc_defaults[0] = value;
+
+		if (regmap_read(data->regmap, EC_ADDR_TCC_DEFAULT_GAMING, &value) == 0)
+			data->tcc_defaults[1] = value;
+
+		if (regmap_read(data->regmap, EC_ADDR_TCC_DEFAULT_TURBO, &value) == 0)
+			data->tcc_defaults[2] = value;
+
+		dev_dbg(data->dev, "TCC defaults: quiet=%u balanced=%u perf=%u\n",
+			data->tcc_defaults[0], data->tcc_defaults[1],
+			data->tcc_defaults[2]);
+	}
 
 	dev_dbg(data->dev, "TDP defaults: quiet=%u/%u/%u gaming=%u/%u/%u\n",
 		data->tdp_defaults[0][0], data->tdp_defaults[0][1],
@@ -3931,6 +3953,26 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 	ret = uniwill_write_pl_values(data, profile_idx);
 	if (ret < 0)
 		return ret;
+
+	if (data->has_tcc_offset) {
+		unsigned int tcc_idx = min_t(unsigned int, profile_idx, 2);
+		unsigned int tcc_val = data->tcc_defaults[tcc_idx];
+
+		/*
+		 * The EC TCC register (APTC/APTN at 0x0786) takes a 7-bit
+		 * temperature target in °C, not an Intel-style TCC offset.
+		 * DSDT confirms this: it writes values like 0x5A (90°C) and
+		 * 0x5F (95°C) directly.  The EC default registers 0x07D8-DA
+		 * store the same kind of temperature targets per profile.
+		 */
+		if (tcc_val != 0 && tcc_val != 0xFF) {
+			tcc_val &= TCC_OFFSET_VALUE_MASK;
+			ret = regmap_write(data->regmap, EC_ADDR_TCC_OFFSET,
+					   TCC_OFFSET_ENABLE | tcc_val);
+			if (ret < 0)
+				return ret;
+		}
+	}
 
 	/* Enable overboost in performance mode on water-cooled devices */
 	if (profile == PLATFORM_PROFILE_PERFORMANCE && !data->overboost_active &&
