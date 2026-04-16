@@ -123,6 +123,10 @@
 
 #define EC_ADDR_BAT_ALERT		0x0494
 
+#define EC_ADDR_BAT_TEMP_1		0x04A2
+
+#define EC_ADDR_BAT_TEMP_2		0x04A3
+
 #define EC_ADDR_BAT_CYCLE_COUNT_1	0x04A6
 
 #define EC_ADDR_BAT_CYCLE_COUNT_2	0x04A7
@@ -459,6 +463,7 @@ struct uniwill_data {
 	unsigned int last_charge_ctrl;
 	bool has_charge_limit;
 	bool has_charge_start_threshold;
+	bool has_battery_temp;
 	struct mutex battery_lock;	/* Protects the list of currently registered batteries */
 	unsigned int last_status;
 	unsigned int last_switch_status;
@@ -560,6 +565,7 @@ static struct uniwill_device_descriptor device_descriptor __ro_after_init;
 static const char * const uniwill_temp_labels[] = {
 	"CPU",
 	"GPU",
+	"Battery",
 };
 
 static const char * const uniwill_fan_labels[] = {
@@ -772,6 +778,8 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SECOND_FAN_RPM_1:
 	case EC_ADDR_SECOND_FAN_RPM_2:
 	case EC_ADDR_BAT_ALERT:
+	case EC_ADDR_BAT_TEMP_1:
+	case EC_ADDR_BAT_TEMP_2:
 	case EC_ADDR_OEM_9:
 	case EC_ADDR_PROJECT_ID:
 	case EC_ADDR_AP_OEM:
@@ -858,6 +866,8 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SECOND_FAN_RPM_1:
 	case EC_ADDR_SECOND_FAN_RPM_2:
 	case EC_ADDR_BAT_ALERT:
+	case EC_ADDR_BAT_TEMP_1:
+	case EC_ADDR_BAT_TEMP_2:
 	case EC_ADDR_BIOS_OEM:
 	case EC_ADDR_PWM_1:
 	case EC_ADDR_PWM_2:
@@ -2780,6 +2790,17 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		case 1:
 			feature = UNIWILL_FEATURE_GPU_TEMP;
 			break;
+		case 2:
+			if (!data->has_battery_temp)
+				return 0;
+
+			switch (attr) {
+			case hwmon_temp_input:
+			case hwmon_temp_label:
+				return 0444;
+			default:
+				return 0;
+			}
 		default:
 			return 0;
 		}
@@ -2902,6 +2923,18 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 			case 1:
 				ret = regmap_read(data->regmap, EC_ADDR_GPU_TEMP, &value);
 				break;
+			case 2:
+				ret = regmap_read(data->regmap, EC_ADDR_BAT_TEMP_1, &value);
+				if (ret < 0)
+					return ret;
+
+				ret = regmap_read(data->regmap, EC_ADDR_BAT_TEMP_2, &value_hi);
+				if (ret < 0)
+					return ret;
+
+				/* EC battery temperature is SBS-style deci-kelvin. */
+				*val = (long)((value_hi << 8) | value) * 100 - 273150;
+				return 0;
 			default:
 				return -EOPNOTSUPP;
 			}
@@ -3650,6 +3683,7 @@ static const struct hwmon_channel_info * const uniwill_info[] = {
 	HWMON_CHANNEL_INFO(chip, HWMON_C_REGISTER_TZ),
 	HWMON_CHANNEL_INFO(temp,
 			   HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_MAX,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
 			   HWMON_T_INPUT | HWMON_T_LABEL),
 	HWMON_CHANNEL_INFO(fan,
 			   HWMON_F_INPUT | HWMON_F_LABEL,
@@ -3675,6 +3709,7 @@ static const struct hwmon_channel_info * const uniwill_info_wc[] = {
 	HWMON_CHANNEL_INFO(chip, HWMON_C_REGISTER_TZ),
 	HWMON_CHANNEL_INFO(temp,
 			   HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_MAX,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
 			   HWMON_T_INPUT | HWMON_T_LABEL),
 	HWMON_CHANNEL_INFO(fan,
 			   HWMON_F_INPUT | HWMON_F_LABEL,
@@ -3709,6 +3744,7 @@ static int uniwill_hwmon_init(struct uniwill_data *data)
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_GPU_TEMP) &&
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN) &&
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_SECONDARY_FAN) &&
+	    !data->has_battery_temp &&
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
 		return 0;
 
@@ -4735,7 +4771,20 @@ static int uniwill_remove_battery(struct power_supply *battery, struct acpi_batt
 static int uniwill_battery_init(struct uniwill_data *data)
 {
 	unsigned int value, threshold;
+	unsigned int value_hi;
+	unsigned int raw_temp;
 	int ret;
+
+	/*
+	 * Probe battery temperature register once at init. The value is exposed
+	 * only when it looks sane to avoid bogus readings on incompatible ECs.
+	 */
+	if (regmap_read(data->regmap, EC_ADDR_BAT_TEMP_1, &value) == 0 &&
+	    regmap_read(data->regmap, EC_ADDR_BAT_TEMP_2, &value_hi) == 0) {
+		raw_temp = (value_hi << 8) | value;
+		if (raw_temp >= 2000 && raw_temp <= 4000)
+			data->has_battery_temp = true;
+	}
 
 	/*
 	 * Auto-detect charge limit support by checking whether the charge
