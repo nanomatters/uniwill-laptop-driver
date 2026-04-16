@@ -175,6 +175,9 @@
 #define EC_ADDR_PL1_DEFAULT_OFFICE	0x0734
 #define EC_ADDR_PL2_DEFAULT_OFFICE	0x0735
 #define EC_ADDR_PL4_DEFAULT_OFFICE	0x0736
+#define EC_ADDR_PL1_DEFAULT_BATTERYSAVER	0x07A7
+#define EC_ADDR_PL2_DEFAULT_BATTERYSAVER	0x07A8
+#define EC_ADDR_PL4_DEFAULT_BATTERYSAVER	0x07A9
 #define EC_ADDR_TCC_DEFAULT_GAMING	0x07D8
 #define EC_ADDR_TCC_DEFAULT_OFFICE	0x07D9
 #define EC_ADDR_TCC_DEFAULT_TURBO	0x07DA
@@ -492,6 +495,8 @@ struct uniwill_data {
 	unsigned int tdp_max[3];
 	/* Per-profile default PL values read from EC firmware registers */
 	unsigned int tdp_defaults[4][3];	/* [profile_idx][pl_idx] */
+	unsigned int tdp_defaults_dc[3];	/* [pl_idx], used when on battery */
+	bool has_battery_saver_defaults;
 	bool overboost_active;		/* True when performance profile is active (water cooler) */
 	unsigned int vrm_saved;		/* VRM current limit before overboost */
 	unsigned int fan_mode;		/* 0=full-speed, 1=manual, 2=auto */
@@ -801,6 +806,9 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL1_DEFAULT_OFFICE:
 	case EC_ADDR_PL2_DEFAULT_OFFICE:
 	case EC_ADDR_PL4_DEFAULT_OFFICE:
+	case EC_ADDR_PL1_DEFAULT_BATTERYSAVER:
+	case EC_ADDR_PL2_DEFAULT_BATTERYSAVER:
+	case EC_ADDR_PL4_DEFAULT_BATTERYSAVER:
 	case EC_ADDR_TCC_DEFAULT_GAMING:
 	case EC_ADDR_TCC_DEFAULT_OFFICE:
 	case EC_ADDR_TCC_DEFAULT_TURBO:
@@ -1714,6 +1722,24 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	data->tdp_defaults[3][0] = data->tdp_max[0];
 	data->tdp_defaults[3][1] = data->tdp_max[1];
 	data->tdp_defaults[3][2] = data->tdp_max[2];
+
+	if (regmap_read(data->regmap, EC_ADDR_PL1_DEFAULT_BATTERYSAVER, &value) == 0)
+		data->tdp_defaults_dc[0] = value;
+
+	if (regmap_read(data->regmap, EC_ADDR_PL2_DEFAULT_BATTERYSAVER, &value) == 0)
+		data->tdp_defaults_dc[1] = value;
+
+	if (regmap_read(data->regmap, EC_ADDR_PL4_DEFAULT_BATTERYSAVER, &value) == 0)
+		data->tdp_defaults_dc[2] = value;
+
+	if (data->tdp_defaults_dc[0] != 0x00 && data->tdp_defaults_dc[0] != 0xFF &&
+	    data->tdp_defaults_dc[1] != 0x00 && data->tdp_defaults_dc[1] != 0xFF &&
+	    data->tdp_defaults_dc[2] != 0x00 && data->tdp_defaults_dc[2] != 0xFF) {
+		data->has_battery_saver_defaults = true;
+		dev_dbg(data->dev, "TDP defaults (DC): %u/%u/%u\n",
+			data->tdp_defaults_dc[0], data->tdp_defaults_dc[1],
+			data->tdp_defaults_dc[2]);
+	}
 
 	if (data->has_tcc_offset) {
 		if (regmap_read(data->regmap, EC_ADDR_TCC_DEFAULT_OFFICE, &value) == 0)
@@ -3870,21 +3896,35 @@ static int uniwill_profile_get(struct device *dev, enum platform_profile_option 
 	}
 }
 
+static bool uniwill_is_on_battery(struct uniwill_data *data)
+{
+	unsigned int value;
+
+	if (regmap_read(data->regmap, EC_ADDR_BAT_STATUS_1, &value) < 0)
+		return false;
+
+	return !!(value & BAT_DISCHARGING);
+}
+
 static int uniwill_write_pl_values(struct uniwill_data *data, int profile_idx)
 {
+	const unsigned int *pl_values = data->tdp_defaults[profile_idx];
 	unsigned int pl4_val;
 	int ret;
 
 	if (!uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL))
 		return 0;
 
+	if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
+		pl_values = data->tdp_defaults_dc;
+
 	ret = regmap_write(data->regmap, EC_ADDR_PL1_SETTING,
-			   data->tdp_defaults[profile_idx][0]);
+			   pl_values[0]);
 	if (ret < 0)
 		return ret;
 
 	ret = regmap_write(data->regmap, EC_ADDR_PL2_SETTING,
-			   data->tdp_defaults[profile_idx][1]);
+			   pl_values[1]);
 	if (ret < 0)
 		return ret;
 
@@ -3892,7 +3932,7 @@ static int uniwill_write_pl_values(struct uniwill_data *data, int profile_idx)
 	 * Some devices store half the PL4 value in the EC register.
 	 * Apply the halving when writing profile defaults.
 	 */
-	pl4_val = data->tdp_defaults[profile_idx][2];
+	pl4_val = pl_values[2];
 	if (data->has_double_pl4 && pl4_val)
 		pl4_val /= 2;
 
