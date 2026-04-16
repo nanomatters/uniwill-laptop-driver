@@ -489,7 +489,7 @@ struct uniwill_data {
 	unsigned int tdp_max[3];
 	/* Per-profile default PL values read from EC firmware registers */
 	unsigned int tdp_defaults[4][3];	/* [profile_idx][pl_idx] */
-	bool overboost_active;		/* True when max-power (overboost) profile is active */
+	bool overboost_active;		/* True when performance profile is active (water cooler) */
 	unsigned int vrm_saved;		/* VRM current limit before overboost */
 	unsigned int fan_mode;		/* 0=full-speed, 1=manual, 2=auto */
 	unsigned int last_fan_pwm[2];	/* Saved PWM values per fan for suspend/resume */
@@ -790,6 +790,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_LIGHTBAR_BAT_BLUE:
 	case EC_ADDR_SYSTEM_ID:
 	case EC_ADDR_CUSTOM_PROFILE:
+	case EC_ADDR_GPU_MUX_MODE:
 	case EC_ADDR_PL1_DEFAULT_GAMING:
 	case EC_ADDR_PL2_DEFAULT_GAMING:
 	case EC_ADDR_PL4_DEFAULT_GAMING:
@@ -1699,10 +1700,9 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	data->tdp_defaults[2][2] = (data->tdp_defaults[1][2] + data->tdp_max[2]) / 2;
 
 	/*
-	 * Overboost (max-power) profile: use the SMRW-reported maximums
-	 * if available, otherwise fall back to hardcoded descriptor limits.
-	 * These are written to the EC together with a raised VRM current
-	 * limit to unlock the full power envelope with liquid cooling.
+	 * Performance profile on water-cooled devices: use the SMRW-reported
+	 * maximums. These are written to the EC together with a raised VRM
+	 * current limit to unlock the full power envelope with liquid cooling.
 	 */
 	data->tdp_defaults[3][0] = data->tdp_max[0];
 	data->tdp_defaults[3][1] = data->tdp_max[1];
@@ -1725,7 +1725,10 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
  */
 
 #define EFI_OEM_MAGIC_MEM_OC_SWITCH	0x33
+#define EFI_OEM_MAGIC_POWER_MODE	0x2F
+#define EFI_OEM_MAGIC_AP_EXIST		0x5D
 #define EFI_OEM_MAGIC_MEM_OC_SUPPORT	0x60
+#define EFI_OEM_MAGIC_AP_USE		0x61
 #define EFI_OEM_MAGIC_CPU_OC_SUPPORT	0x6E
 #define EFI_OEM_MAGIC_CPU_OC_SWITCH	0x6F
 
@@ -1819,6 +1822,67 @@ static void uniwill_show_hidden_bios_options(struct uniwill_data *data)
 	}
 
 	dev_info(data->dev, "hidden_bios_options: enabled hidden BIOS options\n");
+
+out:
+	kfree(buf);
+}
+
+/*
+ * Set the application presence flags in OemMagicVariable.
+ *
+ * The OEM control center (GCU) sets ApExist=1 and ApUse=1 on first
+ * launch to tell the EC firmware that a management application
+ * is present.  Without these flags, the EC may not delegate profile
+ * button LED control to the OS driver.
+ */
+static void uniwill_set_app_presence(struct uniwill_data *data)
+{
+	efi_char16_t name[] = L"OemMagicVariable";
+	unsigned long size = 0;
+	bool changed = false;
+	efi_status_t st;
+	u8 *buf = NULL;
+	u32 attr = 0;
+
+	if (!efi_enabled(EFI_RUNTIME_SERVICES))
+		return;
+
+	st = efi.get_variable(name, &oem_magic_guid, &attr, &size, NULL);
+	if (st != EFI_BUFFER_TOO_SMALL)
+		return;
+
+	if (size <= EFI_OEM_MAGIC_AP_USE)
+		return;
+
+	buf = kmalloc(size, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	st = efi.get_variable(name, &oem_magic_guid, &attr, &size, buf);
+	if (st != EFI_SUCCESS)
+		goto out;
+
+	if (buf[EFI_OEM_MAGIC_AP_EXIST] != 0x01) {
+		buf[EFI_OEM_MAGIC_AP_EXIST] = 0x01;
+		changed = true;
+	}
+
+	if (buf[EFI_OEM_MAGIC_AP_USE] != 0x01) {
+		buf[EFI_OEM_MAGIC_AP_USE] = 0x01;
+		changed = true;
+	}
+
+	if (!changed)
+		goto out;
+
+	st = efi.set_variable(name, &oem_magic_guid, attr, size, buf);
+	if (st != EFI_SUCCESS)
+		dev_warn(data->dev,
+			 "app_presence: set_variable failed: st=0x%lx\n",
+			 (unsigned long)st);
+	else
+		dev_info(data->dev,
+			 "app_presence: set ApExist and ApUse flags\n");
 
 out:
 	kfree(buf);
@@ -3670,7 +3734,7 @@ static bool uniwill_has_gpu_mux(struct uniwill_data *data)
 	unsigned int value;
 	int ret;
 
-	if (!uniwill_device_supports(data, UNIWILL_FEATURE_GPU_TEMP))
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_GPU_MUX))
 		return false;
 
 	ret = regmap_read(data->regmap, EC_ADDR_GPU_MUX_MODE, &value);
@@ -3758,10 +3822,6 @@ static int uniwill_profile_probe(void *drvdata, unsigned long *choices)
 	if (data->num_profiles >= 3)
 		set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
 
-	if (data->num_profiles >= 3 &&
-	    uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
-		set_bit(PLATFORM_PROFILE_MAX_POWER, choices);
-
 	return 0;
 }
 
@@ -3780,10 +3840,7 @@ static int uniwill_profile_get(struct device *dev, enum platform_profile_option 
 		*profile = PLATFORM_PROFILE_QUIET;
 		return 0;
 	case PROFILE_PERFORMANCE:
-		if (data->overboost_active)
-			*profile = PLATFORM_PROFILE_MAX_POWER;
-		else
-			*profile = PLATFORM_PROFILE_PERFORMANCE;
+		*profile = PLATFORM_PROFILE_PERFORMANCE;
 		return 0;
 	default:
 		*profile = PLATFORM_PROFILE_BALANCED;
@@ -3838,18 +3895,21 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		break;
 	case PLATFORM_PROFILE_PERFORMANCE:
 		value = PROFILE_PERFORMANCE;
-		profile_idx = 2;
-		break;
-	case PLATFORM_PROFILE_MAX_POWER:
-		value = PROFILE_PERFORMANCE;
-		profile_idx = 3;
+		/*
+		 * On water-cooled devices, performance mode uses the maximum
+		 * TDP values and enables overboost (raised VRM current limit).
+		 */
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
+			profile_idx = 3;
+		else
+			profile_idx = 2;
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
 
-	/* Disable overboost when leaving max-power profile */
-	if (data->overboost_active && profile != PLATFORM_PROFILE_MAX_POWER) {
+	/* Disable overboost when leaving performance profile */
+	if (data->overboost_active && profile != PLATFORM_PROFILE_PERFORMANCE) {
 		ret = uniwill_set_overboost(data, false);
 		if (ret < 0)
 			return ret;
@@ -3872,8 +3932,9 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 	if (ret < 0)
 		return ret;
 
-	/* Enable overboost after setting performance EC mode */
-	if (profile == PLATFORM_PROFILE_MAX_POWER && !data->overboost_active) {
+	/* Enable overboost in performance mode on water-cooled devices */
+	if (profile == PLATFORM_PROFILE_PERFORMANCE && !data->overboost_active &&
+	    uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER)) {
 		ret = uniwill_set_overboost(data, true);
 		if (ret < 0)
 			return ret;
@@ -3889,7 +3950,6 @@ static const struct platform_profile_ops uniwill_profile_ops = {
 };
 
 /*
- * Custom profile cycling that includes MAX_POWER in the rotation.
  * The kernel's platform_profile_cycle() explicitly skips MAX_POWER
  * and CUSTOM profiles, so we implement our own cycling logic for
  * the Fn key handler.
@@ -3914,12 +3974,6 @@ static int uniwill_profile_cycle(struct uniwill_data *data)
 			next = PLATFORM_PROFILE_QUIET;
 		break;
 	case PLATFORM_PROFILE_PERFORMANCE:
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
-			next = PLATFORM_PROFILE_MAX_POWER;
-		else
-			next = PLATFORM_PROFILE_QUIET;
-		break;
-	case PLATFORM_PROFILE_MAX_POWER:
 		next = PLATFORM_PROFILE_QUIET;
 		break;
 	default:
@@ -4701,22 +4755,20 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 
 			if (regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 					&fan_ctrl) == 0) {
-				int idx;
+				enum platform_profile_option p;
 
 				switch (fan_ctrl & PROFILE_MODE_MASK) {
 				case PROFILE_QUIET:
-					idx = 0;
+					p = PLATFORM_PROFILE_QUIET;
 					break;
 				case PROFILE_PERFORMANCE:
-					idx = data->overboost_active ? 3 : 2;
+					p = PLATFORM_PROFILE_PERFORMANCE;
 					break;
 				default:
-					idx = 1;
+					p = PLATFORM_PROFILE_BALANCED;
 					break;
 				}
-				uniwill_write_pl_values(data, idx);
-				if (data->overboost_active)
-					uniwill_set_overboost(data, true);
+				uniwill_profile_set(data->dev, p);
 			}
 		}
 
@@ -4952,6 +5004,8 @@ static int uniwill_probe(struct platform_device *pdev)
 
 	if (device_descriptor.has_hidden_bios_options)
 		uniwill_show_hidden_bios_options(data);
+
+	uniwill_set_app_presence(data);
 
 	ret = uniwill_profile_init(data);
 	if (ret < 0)
