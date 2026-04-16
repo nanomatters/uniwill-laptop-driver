@@ -362,6 +362,8 @@
 #define EC_ADDR_CHARGE_CTRL_START	0x07D0
 #define CHARGE_CTRL_START_MASK		GENMASK(6, 0)
 
+#define EC_ADDR_SSD_TEMP		0x07D1
+
 #define EC_ADDR_UNIVERSAL_FAN_CTRL	0x07C5
 #define SPLIT_TABLES			BIT(7)
 
@@ -513,6 +515,7 @@ struct uniwill_data {
 	struct mutex dgpu_power_lock;	/* Protects dGPU power toggle via WMI */
 	bool has_gpu_mux;
 	bool has_tcc_offset;
+	bool has_ssd_temp;
 	unsigned int tcc_defaults[3];	/* [0]=quiet, [1]=balanced, [2]=performance */
 	bool dynamic_boost_enable;
 	unsigned int ctgp_max;
@@ -566,6 +569,7 @@ static const char * const uniwill_temp_labels[] = {
 	"CPU",
 	"GPU",
 	"Battery",
+	"SSD",
 };
 
 static const char * const uniwill_fan_labels[] = {
@@ -829,6 +833,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_TCC_OFFSET:
+	case EC_ADDR_SSD_TEMP:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_FAN_CTRL:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
@@ -880,6 +885,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_TCC_OFFSET:
+	case EC_ADDR_SSD_TEMP:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_CHARGE_CTRL_START:
@@ -2801,6 +2807,17 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 			default:
 				return 0;
 			}
+		case 3:
+			if (!data->has_ssd_temp)
+				return 0;
+
+			switch (attr) {
+			case hwmon_temp_input:
+			case hwmon_temp_label:
+				return 0444;
+			default:
+				return 0;
+			}
 		default:
 			return 0;
 		}
@@ -2934,6 +2951,13 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 
 				/* EC battery temperature is SBS-style deci-kelvin. */
 				*val = (long)((value_hi << 8) | value) * 100 - 273150;
+				return 0;
+			case 3:
+				ret = regmap_read(data->regmap, EC_ADDR_SSD_TEMP, &value);
+				if (ret < 0)
+					return ret;
+
+				*val = value * MILLIDEGREE_PER_DEGREE;
 				return 0;
 			default:
 				return -EOPNOTSUPP;
@@ -3684,6 +3708,7 @@ static const struct hwmon_channel_info * const uniwill_info[] = {
 	HWMON_CHANNEL_INFO(temp,
 			   HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_MAX,
 			   HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
 			   HWMON_T_INPUT | HWMON_T_LABEL),
 	HWMON_CHANNEL_INFO(fan,
 			   HWMON_F_INPUT | HWMON_F_LABEL,
@@ -3709,6 +3734,7 @@ static const struct hwmon_channel_info * const uniwill_info_wc[] = {
 	HWMON_CHANNEL_INFO(chip, HWMON_C_REGISTER_TZ),
 	HWMON_CHANNEL_INFO(temp,
 			   HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_MAX,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
 			   HWMON_T_INPUT | HWMON_T_LABEL,
 			   HWMON_T_INPUT | HWMON_T_LABEL),
 	HWMON_CHANNEL_INFO(fan,
@@ -3739,12 +3765,18 @@ static int uniwill_hwmon_init(struct uniwill_data *data)
 {
 	const struct hwmon_chip_info *chip_info;
 	struct device *hdev;
+	unsigned int value;
+
+	if (regmap_read(data->regmap, EC_ADDR_SSD_TEMP, &value) == 0 &&
+	    value != 0xFF && value <= 125)
+		data->has_ssd_temp = true;
 
 	if (!uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TEMP) &&
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_GPU_TEMP) &&
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN) &&
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_SECONDARY_FAN) &&
 	    !data->has_battery_temp &&
+	    !data->has_ssd_temp &&
 	    !uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
 		return 0;
 
