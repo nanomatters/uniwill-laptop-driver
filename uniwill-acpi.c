@@ -100,6 +100,8 @@
 #define EC_ADDR_SYSTEM_ID		0x0456
 #define HAS_GPU				BIT(7)
 
+#define EC_ADDR_EC_VERSION		0x0454
+
 #define EC_ADDR_CPU_TEMP_LIMIT		0x0463
 #define TEMP_LIMIT_TJMAX		105
 
@@ -120,6 +122,8 @@
 #define EC_ADDR_DEVICE_STATUS		0x047B
 #define WIFI_STATUS_ON			BIT(7)
 /* BIT(5) is also unset depending on the rfkill state (bluetooth?) */
+
+#define EC_ADDR_EC_SUB_VERSION		0x047D
 
 #define EC_ADDR_BAT_ALERT		0x0494
 
@@ -777,6 +781,8 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	switch (reg) {
 	case EC_ADDR_CPU_TEMP:
 	case EC_ADDR_GPU_TEMP:
+	case EC_ADDR_EC_VERSION:
+	case EC_ADDR_EC_SUB_VERSION:
 	case EC_ADDR_MAIN_FAN_RPM_1:
 	case EC_ADDR_MAIN_FAN_RPM_2:
 	case EC_ADDR_SECOND_FAN_RPM_1:
@@ -866,6 +872,8 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	switch (reg) {
 	case EC_ADDR_CPU_TEMP:
 	case EC_ADDR_GPU_TEMP:
+	case EC_ADDR_EC_VERSION:
+	case EC_ADDR_EC_SUB_VERSION:
 	case EC_ADDR_MAIN_FAN_RPM_1:
 	case EC_ADDR_MAIN_FAN_RPM_2:
 	case EC_ADDR_SECOND_FAN_RPM_1:
@@ -2230,6 +2238,30 @@ static ssize_t cpu_tcc_offset_store(struct device *dev,
 
 static DEVICE_ATTR_RW(cpu_tcc_offset);
 
+static ssize_t ec_firmware_version_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int major, minor;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_EC_VERSION, &major);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_EC_SUB_VERSION, &minor);
+	if (ret < 0)
+		return ret;
+
+	if (major == 0xFF || minor == 0xFF)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "%u.%02u\n", major, minor);
+}
+
+static DEVICE_ATTR_RO(ec_firmware_version);
+
 /*
  * Check if an NVIDIA dGPU is present on the PCI bus.
  *
@@ -2455,6 +2487,7 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_cpu_pl4.attr,
 	&dev_attr_cpu_pl4_max.attr,
 	&dev_attr_cpu_tcc_offset.attr,
+	&dev_attr_ec_firmware_version.attr,
 	&dev_attr_usb_c_power_priority.attr,
 	&dev_attr_ac_auto_boot.attr,
 	&dev_attr_usb_powershare_high.attr,
@@ -2548,6 +2581,9 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 		if (data->has_tcc_offset)
 			return attr->mode;
 	}
+
+	if (attr == &dev_attr_ec_firmware_version.attr)
+		return attr->mode;
 
 	if (attr == &dev_attr_usb_c_power_priority.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_USB_C_POWER_PRIORITY))
