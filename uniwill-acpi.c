@@ -400,6 +400,10 @@
 
 #define EC_ADDR_LIGHTBAR_BAT_BLUE	0x07E5
 
+#define EC_ADDR_LC_FAN_DUTY		0x07E6
+
+#define EC_ADDR_LC_PUMP_DUTY		0x07E7
+
 #define EC_ADDR_MINI_LED_SUPPORT	0x0D4F
 
 #define EC_ADDR_CPU_TEMP_END_TABLE	0x0F00
@@ -776,6 +780,8 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_COOLING_MODE:
+	case EC_ADDR_LC_FAN_DUTY:
+	case EC_ADDR_LC_PUMP_DUTY:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 	case EC_ADDR_FAN_SWITCH_SPEED:
 	case EC_ADDR_CPU_TEMP_END_TABLE ... EC_ADDR_CPU_TEMP_END_TABLE + 0xF:
@@ -861,6 +867,8 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_COOLING_MODE:
+	case EC_ADDR_LC_FAN_DUTY:
+	case EC_ADDR_LC_PUMP_DUTY:
 	case EC_ADDR_MINI_LED_SUPPORT:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 	case EC_ADDR_ADAPTER_CURRENT:
@@ -2735,6 +2743,8 @@ static ssize_t wc_fan_pwm_store(struct device *dev, struct device_attribute *att
 	mutex_lock(&data->wc.lock);
 	data->wc.fan_pwm = pwm;
 	data->wc.last_update = jiffies;
+	/* Mirror fan duty to EC so firmware can factor in LC cooling */
+	regmap_write(data->regmap, EC_ADDR_LC_FAN_DUTY, pwm * 100 / 255);
 	mutex_unlock(&data->wc.lock);
 	return count;
 }
@@ -2762,6 +2772,8 @@ static ssize_t wc_pump_pwm_store(struct device *dev, struct device_attribute *at
 	mutex_lock(&data->wc.lock);
 	data->wc.pump_pwm = pwm;
 	data->wc.last_update = jiffies;
+	/* Mirror pump duty to EC so firmware can factor in LC cooling */
+	regmap_write(data->regmap, EC_ADDR_LC_PUMP_DUTY, pwm * 100 / 255);
 	mutex_unlock(&data->wc.lock);
 	return count;
 }
