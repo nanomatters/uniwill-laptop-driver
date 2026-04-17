@@ -595,8 +595,8 @@ static const char * const uniwill_temp_labels[] = {
 static const char * const uniwill_fan_labels[] = {
 	"Main",
 	"Secondary",
-	"Water Cooler Fan",
-	"Water Cooler Pump",
+	"WC Fan",
+	"WC Pump",
 };
 
 static const char * const uniwill_power_labels[] = {
@@ -1303,8 +1303,8 @@ static int uniwill_nvidia_ctgp_init(struct uniwill_data *data)
 	return 0;
 }
 
-static ssize_t cpu_pl1_store(struct device *dev, struct device_attribute *attr,
-			     const char *buf, size_t count)
+static ssize_t pl1_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
@@ -1327,8 +1327,8 @@ static ssize_t cpu_pl1_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
-static ssize_t cpu_pl1_show(struct device *dev, struct device_attribute *attr,
-			    char *buf)
+static ssize_t pl1_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
@@ -1341,19 +1341,19 @@ static ssize_t cpu_pl1_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%u\n", value);
 }
 
-static DEVICE_ATTR_RW(cpu_pl1);
+static DEVICE_ATTR_RW(pl1);
 
-static ssize_t cpu_pl1_max_show(struct device *dev, struct device_attribute *attr,
-				char *buf)
+static ssize_t pl1_max_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%u\n", data->tdp_max[0]);
 }
 
-static DEVICE_ATTR_RO(cpu_pl1_max);
+static DEVICE_ATTR_RO(pl1_max);
 
-static ssize_t cpu_pl2_store(struct device *dev, struct device_attribute *attr,
+static ssize_t pl2_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -1377,8 +1377,8 @@ static ssize_t cpu_pl2_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
-static ssize_t cpu_pl2_show(struct device *dev, struct device_attribute *attr,
-			    char *buf)
+static ssize_t pl2_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
@@ -1391,19 +1391,19 @@ static ssize_t cpu_pl2_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%u\n", value);
 }
 
-static DEVICE_ATTR_RW(cpu_pl2);
+static DEVICE_ATTR_RW(pl2);
 
-static ssize_t cpu_pl2_max_show(struct device *dev, struct device_attribute *attr,
-				char *buf)
+static ssize_t pl2_max_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%u\n", data->tdp_max[1]);
 }
 
-static DEVICE_ATTR_RO(cpu_pl2_max);
+static DEVICE_ATTR_RO(pl2_max);
 
-static ssize_t cpu_pl4_store(struct device *dev, struct device_attribute *attr,
+static ssize_t pl4_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -1437,8 +1437,8 @@ static ssize_t cpu_pl4_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
-static ssize_t cpu_pl4_show(struct device *dev, struct device_attribute *attr,
-			    char *buf)
+static ssize_t pl4_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
@@ -1454,17 +1454,17 @@ static ssize_t cpu_pl4_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%u\n", value);
 }
 
-static DEVICE_ATTR_RW(cpu_pl4);
+static DEVICE_ATTR_RW(pl4);
 
-static ssize_t cpu_pl4_max_show(struct device *dev, struct device_attribute *attr,
-				char *buf)
+static ssize_t pl4_max_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%u\n", data->tdp_max[2]);
 }
 
-static DEVICE_ATTR_RO(cpu_pl4_max);
+static DEVICE_ATTR_RO(pl4_max);
 
 #define SMRW_BUFFER_SIZE	13
 #define SMRW_CMD_READ		0xBB
@@ -2206,21 +2206,25 @@ static ssize_t mini_led_local_dimming_show(struct device *dev, struct device_att
 static DEVICE_ATTR_RW(mini_led_local_dimming);
 
 /*
- * CPU TCC (Thermal Control Circuit) offset.
+ * CPU TCC (Thermal Control Circuit) temperature target.
  *
- * The TCC offset lowers the temperature at which the CPU begins thermal
- * throttling. For example, with Tjunction_max = 100°C and a TCC offset
- * of 10, throttling starts at 90°C.
+ * The EC TCC register stores an absolute temperature target in °C at which
+ * the CPU begins thermal throttling.  For example, writing 90 means the CPU
+ * will throttle at 90°C.  This is NOT an Intel-style TCC offset subtracted
+ * from Tjunction_max.
  *
  * EC register 0x0786 layout (confirmed via DSDT APTC/APTN fields):
- *   bits [6:0] = offset value in degrees Celsius (0-63)
- *   bit  [7]   = enable (1 = offset active, 0 = disabled)
+ *   bits [6:0] = temperature target in degrees Celsius (0-127)
+ *   bit  [7]   = enable (1 = target active, 0 = disabled)
  *
- * Writing 0 disables the TCC offset entirely (clears enable bit).
- * Writing a non-zero value sets the offset and enables it.
+ * The EC default registers 0x07D8-DA store per-profile temperature targets
+ * (e.g. 80 for quiet, 95 for balanced/performance).
+ *
+ * Writing 0 disables the TCC target entirely (clears enable bit).
+ * Writing a non-zero value sets the temperature target and enables it.
  */
-static ssize_t cpu_tcc_offset_show(struct device *dev,
-				   struct device_attribute *attr, char *buf)
+static ssize_t tcc_temp_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
@@ -2236,26 +2240,26 @@ static ssize_t cpu_tcc_offset_show(struct device *dev,
 	return sysfs_emit(buf, "%u\n", (unsigned int)(value & TCC_OFFSET_VALUE_MASK));
 }
 
-static ssize_t cpu_tcc_offset_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
+static ssize_t tcc_temp_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
-	unsigned int offset;
+	unsigned int temp;
 	u8 value;
 	int ret;
 
-	ret = kstrtouint(buf, 10, &offset);
+	ret = kstrtouint(buf, 10, &temp);
 	if (ret < 0)
 		return ret;
 
-	if (offset > TCC_OFFSET_MAX)
+	if (temp > TCC_OFFSET_MAX)
 		return -EINVAL;
 
-	if (offset == 0)
+	if (temp == 0)
 		value = 0;
 	else
-		value = TCC_OFFSET_ENABLE | offset;
+		value = TCC_OFFSET_ENABLE | temp;
 
 	ret = regmap_write(data->regmap, EC_ADDR_TCC_OFFSET, value);
 	if (ret < 0)
@@ -2264,7 +2268,7 @@ static ssize_t cpu_tcc_offset_store(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR_RW(cpu_tcc_offset);
+static DEVICE_ATTR_RW(tcc_temp);
 
 static ssize_t ec_firmware_version_show(struct device *dev,
 					struct device_attribute *attr,
@@ -2318,12 +2322,12 @@ static bool uniwill_dgpu_is_on(void)
 	return false;
 }
 
-static ssize_t dgpu_power_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t power_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%d\n", uniwill_dgpu_is_on() ? 1 : 0);
 }
 
-static ssize_t dgpu_power_store(struct device *dev, struct device_attribute *attr,
+static ssize_t power_store(struct device *dev, struct device_attribute *attr,
 				const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2372,9 +2376,9 @@ static ssize_t dgpu_power_store(struct device *dev, struct device_attribute *att
 	return count;
 }
 
-static DEVICE_ATTR_RW(dgpu_power);
+static DEVICE_ATTR_RW(power);
 
-static ssize_t gpu_mux_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t mux_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
@@ -2457,8 +2461,8 @@ out:
 	return ret;
 }
 
-static ssize_t gpu_mux_mode_store(struct device *dev, struct device_attribute *attr,
-				  const char *buf, size_t count)
+static ssize_t mux_mode_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int mode;
@@ -2492,7 +2496,7 @@ static ssize_t gpu_mux_mode_store(struct device *dev, struct device_attribute *a
 	return count;
 }
 
-static DEVICE_ATTR_RW(gpu_mux_mode);
+static DEVICE_ATTR_RW(mux_mode);
 
 static struct attribute *uniwill_attrs[] = {
 	/* Keyboard-related */
@@ -2502,31 +2506,14 @@ static struct attribute *uniwill_attrs[] = {
 	/* Lightbar-related */
 	&dev_attr_rainbow_animation.attr,
 	&dev_attr_breathing_in_suspend.attr,
-	/* Power-management-related */
-	&dev_attr_ctgp_offset.attr,
-	&dev_attr_ctgp_offset_max.attr,
-	&dev_attr_db_offset_max.attr,
-	&dev_attr_tgp_base.attr,
-	&dev_attr_dynamic_boost_enable.attr,
-	&dev_attr_cpu_pl1.attr,
-	&dev_attr_cpu_pl1_max.attr,
-	&dev_attr_cpu_pl2.attr,
-	&dev_attr_cpu_pl2_max.attr,
-	&dev_attr_cpu_pl4.attr,
-	&dev_attr_cpu_pl4_max.attr,
-	&dev_attr_cpu_tcc_offset.attr,
+	/* Misc */
 	&dev_attr_ec_firmware_version.attr,
 	&dev_attr_usb_c_power_priority.attr,
 	&dev_attr_ac_auto_boot.attr,
 	&dev_attr_usb_powershare_high.attr,
 	/* Display-related */
 	&dev_attr_mini_led_local_dimming.attr,
-	&dev_attr_vrm_current_limit.attr,
-	&dev_attr_vrm_max_current_limit.attr,
 	&dev_attr_fan_switch_speed.attr,
-	/* GPU-related */
-	&dev_attr_dgpu_power.attr,
-	&dev_attr_gpu_mux_mode.attr,
 	NULL
 };
 
@@ -2556,60 +2543,6 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 			return attr->mode;
 	}
 
-	if (attr == &dev_attr_ctgp_offset.attr) {
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_ctgp_offset_max.attr) {
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
-		    data->ctgp_max)
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_db_offset_max.attr) {
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
-		    data->db_max)
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_tgp_base.attr) {
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
-		    data->tgp_base)
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_dynamic_boost_enable.attr) {
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_cpu_pl1.attr ||
-	    attr == &dev_attr_cpu_pl1_max.attr) {
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
-		    data->tdp_max[0])
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_cpu_pl2.attr ||
-	    attr == &dev_attr_cpu_pl2_max.attr) {
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
-		    data->tdp_max[1])
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_cpu_pl4.attr ||
-	    attr == &dev_attr_cpu_pl4_max.attr) {
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
-		    data->tdp_max[2])
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_cpu_tcc_offset.attr) {
-		if (data->has_tcc_offset)
-			return attr->mode;
-	}
-
 	if (attr == &dev_attr_ec_firmware_version.attr)
 		return attr->mode;
 
@@ -2633,24 +2566,8 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 			return attr->mode;
 	}
 
-	if (attr == &dev_attr_vrm_current_limit.attr ||
-	    attr == &dev_attr_vrm_max_current_limit.attr) {
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL))
-			return attr->mode;
-	}
-
 	if (attr == &dev_attr_fan_switch_speed.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN))
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_dgpu_power.attr) {
-		if (data->has_dgpu_power)
-			return attr->mode;
-	}
-
-	if (attr == &dev_attr_gpu_mux_mode.attr) {
-		if (data->has_gpu_mux)
 			return attr->mode;
 	}
 
@@ -2662,13 +2579,135 @@ static const struct attribute_group uniwill_group = {
 	.attrs = uniwill_attrs,
 };
 
-/* Forward declarations for profile functions used in wc_enable_store */
+/* CPU sysfs attribute group — exposed under cpu/ subdirectory */
+
+static struct attribute *uniwill_cpu_attrs[] = {
+	&dev_attr_pl1.attr,
+	&dev_attr_pl1_max.attr,
+	&dev_attr_pl2.attr,
+	&dev_attr_pl2_max.attr,
+	&dev_attr_pl4.attr,
+	&dev_attr_pl4_max.attr,
+	&dev_attr_tcc_temp.attr,
+	&dev_attr_vrm_current_limit.attr,
+	&dev_attr_vrm_max_current_limit.attr,
+	NULL
+};
+
+static umode_t uniwill_cpu_is_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	if (attr == &dev_attr_pl1.attr ||
+	    attr == &dev_attr_pl1_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
+		    data->tdp_max[0])
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_pl2.attr ||
+	    attr == &dev_attr_pl2_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
+		    data->tdp_max[1])
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_pl4.attr ||
+	    attr == &dev_attr_pl4_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
+		    data->tdp_max[2])
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_tcc_temp.attr) {
+		if (data->has_tcc_offset)
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_vrm_current_limit.attr ||
+	    attr == &dev_attr_vrm_max_current_limit.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL))
+			return attr->mode;
+	}
+
+	return 0;
+}
+
+static const struct attribute_group uniwill_cpu_group = {
+	.name = "cpu",
+	.is_visible = uniwill_cpu_is_visible,
+	.attrs = uniwill_cpu_attrs,
+};
+
+/* dGPU sysfs attribute group — exposed under dgpu/ subdirectory */
+
+static struct attribute *uniwill_dgpu_attrs[] = {
+	&dev_attr_ctgp_offset.attr,
+	&dev_attr_ctgp_offset_max.attr,
+	&dev_attr_db_offset_max.attr,
+	&dev_attr_tgp_base.attr,
+	&dev_attr_dynamic_boost_enable.attr,
+	&dev_attr_power.attr,
+	&dev_attr_mux_mode.attr,
+	NULL
+};
+
+static umode_t uniwill_dgpu_is_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	if (attr == &dev_attr_ctgp_offset.attr ||
+	    attr == &dev_attr_dynamic_boost_enable.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_ctgp_offset_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
+		    data->ctgp_max)
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_db_offset_max.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
+		    data->db_max)
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_tgp_base.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
+		    data->tgp_base)
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_power.attr) {
+		if (data->has_dgpu_power)
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_mux_mode.attr) {
+		if (data->has_gpu_mux)
+			return attr->mode;
+	}
+
+	return 0;
+}
+
+static const struct attribute_group uniwill_dgpu_group = {
+	.name = "dgpu",
+	.is_visible = uniwill_dgpu_is_visible,
+	.attrs = uniwill_dgpu_attrs,
+};
+
+/* Forward declarations for profile functions used in enable_store */
 static int uniwill_profile_get(struct device *dev, enum platform_profile_option *profile);
 static int uniwill_profile_set(struct device *dev, enum platform_profile_option profile);
 
 /* Water cooler sysfs bridge attributes */
 
-static ssize_t wc_fan_rpm_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t fan_rpm_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int rpm;
@@ -2679,7 +2718,7 @@ static ssize_t wc_fan_rpm_show(struct device *dev, struct device_attribute *attr
 	return sysfs_emit(buf, "%u\n", rpm);
 }
 
-static ssize_t wc_fan_rpm_store(struct device *dev, struct device_attribute *attr,
+static ssize_t fan_rpm_store(struct device *dev, struct device_attribute *attr,
 				const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2695,7 +2734,7 @@ static ssize_t wc_fan_rpm_store(struct device *dev, struct device_attribute *att
 	return count;
 }
 
-static ssize_t wc_pump_rpm_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t pump_rpm_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int rpm;
@@ -2706,7 +2745,7 @@ static ssize_t wc_pump_rpm_show(struct device *dev, struct device_attribute *att
 	return sysfs_emit(buf, "%u\n", rpm);
 }
 
-static ssize_t wc_pump_rpm_store(struct device *dev, struct device_attribute *attr,
+static ssize_t pump_rpm_store(struct device *dev, struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2722,7 +2761,7 @@ static ssize_t wc_pump_rpm_store(struct device *dev, struct device_attribute *at
 	return count;
 }
 
-static ssize_t wc_fan_pwm_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t fan_pwm_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	u8 pwm;
@@ -2733,7 +2772,7 @@ static ssize_t wc_fan_pwm_show(struct device *dev, struct device_attribute *attr
 	return sysfs_emit(buf, "%u\n", pwm);
 }
 
-static ssize_t wc_fan_pwm_store(struct device *dev, struct device_attribute *attr,
+static ssize_t fan_pwm_store(struct device *dev, struct device_attribute *attr,
 				const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2751,7 +2790,7 @@ static ssize_t wc_fan_pwm_store(struct device *dev, struct device_attribute *att
 	return count;
 }
 
-static ssize_t wc_pump_pwm_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t pump_pwm_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	u8 pwm;
@@ -2762,7 +2801,7 @@ static ssize_t wc_pump_pwm_show(struct device *dev, struct device_attribute *att
 	return sysfs_emit(buf, "%u\n", pwm);
 }
 
-static ssize_t wc_pump_pwm_store(struct device *dev, struct device_attribute *attr,
+static ssize_t pump_pwm_store(struct device *dev, struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2780,8 +2819,8 @@ static ssize_t wc_pump_pwm_store(struct device *dev, struct device_attribute *at
 	return count;
 }
 
-static ssize_t wc_fan_pwm_target_show(struct device *dev, struct device_attribute *attr,
-				      char *buf)
+static ssize_t fan_pwm_target_show(struct device *dev, struct device_attribute *attr,
+				   char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	u8 target;
@@ -2792,8 +2831,8 @@ static ssize_t wc_fan_pwm_target_show(struct device *dev, struct device_attribut
 	return sysfs_emit(buf, "%u\n", target);
 }
 
-static ssize_t wc_pump_pwm_target_show(struct device *dev, struct device_attribute *attr,
-				       char *buf)
+static ssize_t pump_pwm_target_show(struct device *dev, struct device_attribute *attr,
+				    char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	u8 target;
@@ -2804,21 +2843,21 @@ static ssize_t wc_pump_pwm_target_show(struct device *dev, struct device_attribu
 	return sysfs_emit(buf, "%u\n", target);
 }
 
-static ssize_t wc_fan_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t fan_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%u\n", data->wc.fan_mode);
 }
 
-static ssize_t wc_enable_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t enable_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%u\n", data->wc.enable);
 }
 
-static ssize_t wc_enable_store(struct device *dev, struct device_attribute *attr,
+static ssize_t enable_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -2855,24 +2894,24 @@ static ssize_t wc_enable_store(struct device *dev, struct device_attribute *attr
 	return count;
 }
 
-static DEVICE_ATTR_RW(wc_fan_rpm);
-static DEVICE_ATTR_RW(wc_pump_rpm);
-static DEVICE_ATTR_RW(wc_fan_pwm);
-static DEVICE_ATTR_RW(wc_pump_pwm);
-static DEVICE_ATTR_RO(wc_fan_pwm_target);
-static DEVICE_ATTR_RO(wc_pump_pwm_target);
-static DEVICE_ATTR_RO(wc_fan_mode);
-static DEVICE_ATTR_RW(wc_enable);
+static DEVICE_ATTR_RW(fan_rpm);
+static DEVICE_ATTR_RW(pump_rpm);
+static DEVICE_ATTR_RW(fan_pwm);
+static DEVICE_ATTR_RW(pump_pwm);
+static DEVICE_ATTR_RO(fan_pwm_target);
+static DEVICE_ATTR_RO(pump_pwm_target);
+static DEVICE_ATTR_RO(fan_mode);
+static DEVICE_ATTR_RW(enable);
 
 static struct attribute *uniwill_wc_attrs[] = {
-	&dev_attr_wc_fan_rpm.attr,
-	&dev_attr_wc_pump_rpm.attr,
-	&dev_attr_wc_fan_pwm.attr,
-	&dev_attr_wc_pump_pwm.attr,
-	&dev_attr_wc_fan_pwm_target.attr,
-	&dev_attr_wc_pump_pwm_target.attr,
-	&dev_attr_wc_fan_mode.attr,
-	&dev_attr_wc_enable.attr,
+	&dev_attr_fan_rpm.attr,
+	&dev_attr_pump_rpm.attr,
+	&dev_attr_fan_pwm.attr,
+	&dev_attr_pump_pwm.attr,
+	&dev_attr_fan_pwm_target.attr,
+	&dev_attr_pump_pwm_target.attr,
+	&dev_attr_fan_mode.attr,
+	&dev_attr_enable.attr,
 	NULL
 };
 
@@ -2888,13 +2927,15 @@ static umode_t uniwill_wc_is_visible(struct kobject *kobj, struct attribute *att
 }
 
 static const struct attribute_group uniwill_wc_group = {
-	.name = "water_cooler",
+	.name = "wc",
 	.is_visible = uniwill_wc_is_visible,
 	.attrs = uniwill_wc_attrs,
 };
 
 static const struct attribute_group *uniwill_groups[] = {
 	&uniwill_group,
+	&uniwill_cpu_group,
+	&uniwill_dgpu_group,
 	&uniwill_wc_group,
 	NULL
 };
@@ -3539,7 +3580,7 @@ static int uniwill_write(struct device *dev, enum hwmon_sensor_types type, u32 a
 				if (val < 0 || val > 2)
 					return -EINVAL;
 				data->wc.fan_mode = val;
-				sysfs_notify(&data->dev->kobj, "water_cooler",
+				sysfs_notify(&data->dev->kobj, "wc",
 					     "fan_mode");
 				return 0;
 			}
@@ -3554,7 +3595,7 @@ static int uniwill_write(struct device *dev, enum hwmon_sensor_types type, u32 a
 				else
 					data->wc.pump_pwm_target = val;
 				mutex_unlock(&data->wc.lock);
-				sysfs_notify(&data->dev->kobj, "water_cooler",
+				sysfs_notify(&data->dev->kobj, "wc",
 					     (channel == 2) ? "fan_pwm_target"
 							    : "pump_pwm_target");
 				return 0;

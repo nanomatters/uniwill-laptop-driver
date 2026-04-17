@@ -52,7 +52,7 @@ Description:
 		Reading this file returns the current status of the breathing animation
 		functionality.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/ctgp_offset
+What:		/sys/bus/platform/devices/INOU0000:XX/dgpu/ctgp_offset
 Date:		January 2026
 KernelVersion:	7.0
 Contact:	Werner Sembach <wse@tuxedocomputers.com>
@@ -64,7 +64,7 @@ Description:
 
 		Reading this file returns the current configurable TGP offset.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/dynamic_boost_enable
+What:		/sys/bus/platform/devices/INOU0000:XX/dgpu/dynamic_boost_enable
 Date:		July 2026
 KernelVersion:	6.16
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -76,53 +76,53 @@ Description:
 
 		Reading this file returns 1 if Dynamic Boost is currently enabled, 0 otherwise.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/cpu_pl1
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl1
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Allows userspace applications to set the CPU PL1 (long duration power limit) in
-		watts. The acceptable range is device specific and is capped at the device-specific maximum reported by cpu_pl1_max.
+		watts. The acceptable range is device specific and is capped at the device-specific maximum reported by pl1_max.
 
 		Reading this file returns the current PL1 value in watts.
 
 		Writes are only permitted when the performance (overboost) profile is active.
 		Attempting to write in other profiles returns -EACCES.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/cpu_pl1_max
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl1_max
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Returns the maximum allowed CPU PL1 value in watts for this device.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/cpu_pl2
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl2
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Allows userspace applications to set the CPU PL2 (short duration power limit) in
-		watts. The acceptable range is device specific and is capped at the device-specific maximum reported by cpu_pl2_max.
+		watts. The acceptable range is device specific and is capped at the device-specific maximum reported by pl2_max.
 
 		Reading this file returns the current PL2 value in watts.
 
 		Writes are only permitted when the performance (overboost) profile is active.
 		Attempting to write in other profiles returns -EACCES.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/cpu_pl2_max
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl2_max
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Returns the maximum allowed CPU PL2 value in watts for this device.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/cpu_pl4
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl4
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Allows userspace applications to set the CPU PL4 (peak power limit) in watts. The
-		acceptable range is device specific and is capped at the device-specific maximum reported by cpu_pl4_max. On devices with "double PL4" support, the EC stores half the actual
+		acceptable range is device specific and is capped at the device-specific maximum reported by pl4_max. On devices with "double PL4" support, the EC stores half the actual
 		value internally but the sysfs interface always operates in effective watts.
 
 		Reading this file returns the current PL4 value in watts.
@@ -130,7 +130,7 @@ Description:
 		Writes are only permitted when the performance (overboost) profile is active.
 		Attempting to write in other profiles returns -EACCES.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/cpu_pl4_max
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl4_max
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -188,7 +188,7 @@ Description:
 		local dimming. The current state cannot be read from hardware, so reading this file
 		returns the last written value.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_fan_rpm
+What:		/sys/bus/platform/devices/INOU0000:XX/wc/fan_rpm
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -198,7 +198,7 @@ Description:
 
 		Reading this file returns the last reported fan RPM value.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_pump_rpm
+What:		/sys/bus/platform/devices/INOU0000:XX/wc/pump_rpm
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -208,7 +208,7 @@ Description:
 
 		Reading this file returns the last reported pump RPM value.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_fan_pwm
+What:		/sys/bus/platform/devices/INOU0000:XX/wc/fan_pwm
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -219,7 +219,7 @@ Description:
 
 		Reading this file returns the last reported fan PWM value.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_pump_pwm
+What:		/sys/bus/platform/devices/INOU0000:XX/wc/pump_pwm
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -230,7 +230,7 @@ Description:
 
 		Reading this file returns the last reported pump PWM value.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_fan_pwm_target
+What:		/sys/bus/platform/devices/INOU0000:XX/wc/fan_pwm_target
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -239,7 +239,7 @@ Description:
 		logic. A userspace daemon reads this to apply the target to the water cooler
 		hardware.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_pump_pwm_target
+What:		/sys/bus/platform/devices/INOU0000:XX/wc/pump_pwm_target
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -248,14 +248,14 @@ Description:
 		logic. A userspace daemon reads this to apply the target to the water cooler
 		hardware.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_fan_mode
+What:		/sys/bus/platform/devices/INOU0000:XX/wc/fan_mode
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Returns the current water cooler fan control mode as an unsigned integer.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/ctgp_offset_max
+What:		/sys/bus/platform/devices/INOU0000:XX/dgpu/ctgp_offset_max
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -267,7 +267,7 @@ Description:
 		This attribute is only available on devices with NVIDIA cTGP control support and
 		a valid SMRW table entry.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/db_offset_max
+What:		/sys/bus/platform/devices/INOU0000:XX/dgpu/db_offset_max
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -278,7 +278,7 @@ Description:
 		This attribute is only available on devices with NVIDIA cTGP control support and
 		a valid SMRW table entry.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/tgp_base
+What:		/sys/bus/platform/devices/INOU0000:XX/dgpu/tgp_base
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -289,7 +289,7 @@ Description:
 		This attribute is only available on devices with NVIDIA cTGP control support and
 		a valid SMRW table entry.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/vrm_current_limit
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu/vrm_current_limit
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -297,7 +297,7 @@ Description:
 		Returns the current VRM (Voltage Regulator Module) current limit setting as an
 		unsigned integer, read from the EC.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/vrm_max_current_limit
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu/vrm_max_current_limit
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -316,7 +316,7 @@ Description:
 		Reading this file returns the current delay in milliseconds, or "0" if the
 		feature is disabled.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/dgpu_power
+What:		/sys/bus/platform/devices/INOU0000:XX/dgpu/power
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -328,7 +328,7 @@ Description:
 
 		This attribute is only available on devices with dGPU power control support.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/gpu_mux_mode
+What:		/sys/bus/platform/devices/INOU0000:XX/dgpu/mux_mode
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
@@ -342,19 +342,21 @@ Description:
 
 		This attribute is only available on devices with a GPU MUX switch.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/cpu_tcc_offset
+What:		/sys/bus/platform/devices/INOU0000:XX/cpu/tcc_temp
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Controls the CPU thermal throttling temperature target via the EC TCC register.
-		The value is a temperature in degrees Celsius (0-127). Writing "0" disables the
-		TCC override; writing a non-zero value sets and enables it.
+		The value is an absolute temperature in degrees Celsius (0-127) at which the CPU
+		will begin throttling.  This is NOT an Intel-style TCC offset subtracted from
+		Tjunction_max.  Writing "0" disables the TCC override; writing a non-zero value
+		sets the temperature target and enables it.
 
 		Reading this file returns the current temperature target, or "0" if the TCC
 		override is disabled.
 
-		This attribute is only available on devices with TCC offset support.
+		This attribute is only available on devices with TCC support.
 
 What:		/sys/bus/platform/devices/INOU0000:XX/ec_firmware_version
 Date:		April 2026
@@ -365,7 +367,7 @@ Description:
 
 		Returns -ENODATA if the firmware version cannot be read.
 
-What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_enable
+What:		/sys/bus/platform/devices/INOU0000:XX/wc/enable
 Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
