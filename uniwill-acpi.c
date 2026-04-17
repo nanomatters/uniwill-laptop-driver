@@ -934,8 +934,6 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SYSTEM_POWER_HI:
 	case EC_ADDR_GPU_POWER_ALLOC:
 	case EC_ADDR_THERMAL_BUDGET:
-	case EC_ADDR_CPU_FAN_SPEED_TABLE ... EC_ADDR_CPU_FAN_SPEED_TABLE + 0xF:
-	case EC_ADDR_GPU_FAN_SPEED_TABLE ... EC_ADDR_GPU_FAN_SPEED_TABLE + 0xF:
 		return true;
 	default:
 		return false;
@@ -3252,94 +3250,104 @@ static int uniwill_read_string(struct device *dev, enum hwmon_sensor_types type,
 }
 
 #define FAN_TABLE_ZONES		16
-#define FAN_TABLE_MAX_TEMP	115
 #define FAN_TABLE_MAX_SPEED	0xC8	/* 200 = full speed */
+
+/*
+ * Default balanced fan curve from UCC (uniwill control center).
+ * 16 zones covering 25-100 C with 3 C hysteresis.
+ * Duty values are in EC scale (0-200, i.e. percent * 2).
+ *
+ * CPU curve: 0% up to 45 C, ramps from 17% at 50 C to 100% at 100 C.
+ * GPU curve: identical ramp, slightly more aggressive at 90+ C.
+ */
+struct fan_curve_zone {
+	u8 temp_up;
+	u8 temp_down;
+	u8 duty;
+};
+
+static const struct fan_curve_zone default_cpu_curve[FAN_TABLE_ZONES] = {
+	{ 25,  0, 0   },	/* zone  0: off below 25 C */
+	{ 30, 27, 0   },	/* zone  1 */
+	{ 35, 32, 0   },	/* zone  2 */
+	{ 40, 37, 0   },	/* zone  3 */
+	{ 45, 42, 0   },	/* zone  4 */
+	{ 50, 47, 34  },	/* zone  5: 17% */
+	{ 55, 52, 50  },	/* zone  6: 25% */
+	{ 60, 57, 62  },	/* zone  7: 31% */
+	{ 65, 62, 76  },	/* zone  8: 38% */
+	{ 70, 67, 100 },	/* zone  9: 50% */
+	{ 75, 72, 110 },	/* zone 10: 55% */
+	{ 80, 77, 130 },	/* zone 11: 65% */
+	{ 85, 82, 156 },	/* zone 12: 78% */
+	{ 90, 87, 176 },	/* zone 13: 88% */
+	{ 95, 92, 192 },	/* zone 14: 96% */
+	{100, 97, 200 },	/* zone 15: 100% */
+};
+
+static const struct fan_curve_zone default_gpu_curve[FAN_TABLE_ZONES] = {
+	{ 25,  0, 0   },
+	{ 30, 27, 0   },
+	{ 35, 32, 0   },
+	{ 40, 37, 0   },
+	{ 45, 42, 0   },
+	{ 50, 47, 34  },	/* 17% */
+	{ 55, 52, 50  },	/* 25% */
+	{ 60, 57, 62  },	/* 31% */
+	{ 65, 62, 76  },	/* 38% */
+	{ 70, 67, 100 },	/* 50% */
+	{ 75, 72, 110 },	/* 55% */
+	{ 80, 77, 130 },	/* 65% */
+	{ 85, 82, 156 },	/* 78% */
+	{ 90, 87, 180 },	/* 90% */
+	{ 95, 92, 190 },	/* 95% */
+	{100, 97, 200 },	/* 100% */
+};
 
 static int uniwill_fan_init_tables(struct uniwill_data *data)
 {
-	unsigned int cpu_speed, gpu_speed;
 	int i, ret;
 
 	/*
-	 * Initialize custom fan tables with a single controllable zone spanning
-	 * from 0 to 115 degrees, and fill the remaining zones with safety dummy
-	 * entries at increasing temperatures beyond the controllable range.
-	 *
-	 * For zone 0 (the controllable zone), preserve the current fan speed
-	 * read from the EC so that switching to manual mode does not cause an
-	 * unexpected speed change. Fall back to full speed if the read fails.
+	 * Write the default balanced fan curve to the EC custom fan table
+	 * registers. This curve is used when custom auto mode (pwm_enable=3)
+	 * is activated. The EC ignores these registers until
+	 * ENABLE_UNIVERSAL_FAN_CTRL is set.
 	 */
-	if (regmap_read(data->regmap, EC_ADDR_PWM_1, &cpu_speed) < 0)
-		cpu_speed = FAN_TABLE_MAX_SPEED;
-	else
-		cpu_speed = min(cpu_speed, (unsigned int)FAN_TABLE_MAX_SPEED);
-
-	if (regmap_read(data->regmap, EC_ADDR_PWM_2, &gpu_speed) < 0)
-		gpu_speed = FAN_TABLE_MAX_SPEED;
-	else
-		gpu_speed = min(gpu_speed, (unsigned int)FAN_TABLE_MAX_SPEED);
-
-	data->last_fan_pwm[0] = cpu_speed;
-	data->last_fan_pwm[1] = gpu_speed;
-
-	ret = regmap_write(data->regmap, EC_ADDR_CPU_TEMP_END_TABLE, FAN_TABLE_MAX_TEMP);
-	if (ret < 0)
-		return ret;
-
-	ret = regmap_write(data->regmap, EC_ADDR_CPU_TEMP_START_TABLE, 0);
-	if (ret < 0)
-		return ret;
-
-	ret = regmap_write(data->regmap, EC_ADDR_CPU_FAN_SPEED_TABLE, cpu_speed);
-	if (ret < 0)
-		return ret;
-
-	ret = regmap_write(data->regmap, EC_ADDR_GPU_TEMP_END_TABLE, FAN_TABLE_MAX_TEMP + 5);
-	if (ret < 0)
-		return ret;
-
-	ret = regmap_write(data->regmap, EC_ADDR_GPU_TEMP_START_TABLE, 0);
-	if (ret < 0)
-		return ret;
-
-	ret = regmap_write(data->regmap, EC_ADDR_GPU_FAN_SPEED_TABLE, gpu_speed);
-	if (ret < 0)
-		return ret;
-
-	for (i = 1; i < FAN_TABLE_ZONES; i++) {
+	for (i = 0; i < FAN_TABLE_ZONES; i++) {
 		ret = regmap_write(data->regmap,
 				   EC_ADDR_CPU_TEMP_END_TABLE + i,
-				   FAN_TABLE_MAX_TEMP + i + 1);
+				   default_cpu_curve[i].temp_up);
 		if (ret < 0)
 			return ret;
 
 		ret = regmap_write(data->regmap,
 				   EC_ADDR_CPU_TEMP_START_TABLE + i,
-				   FAN_TABLE_MAX_TEMP + i);
+				   default_cpu_curve[i].temp_down);
 		if (ret < 0)
 			return ret;
 
 		ret = regmap_write(data->regmap,
 				   EC_ADDR_CPU_FAN_SPEED_TABLE + i,
-				   FAN_TABLE_MAX_SPEED);
+				   default_cpu_curve[i].duty);
 		if (ret < 0)
 			return ret;
 
 		ret = regmap_write(data->regmap,
 				   EC_ADDR_GPU_TEMP_END_TABLE + i,
-				   FAN_TABLE_MAX_TEMP + i + 1);
+				   default_gpu_curve[i].temp_up);
 		if (ret < 0)
 			return ret;
 
 		ret = regmap_write(data->regmap,
 				   EC_ADDR_GPU_TEMP_START_TABLE + i,
-				   FAN_TABLE_MAX_TEMP + i);
+				   default_gpu_curve[i].temp_down);
 		if (ret < 0)
 			return ret;
 
 		ret = regmap_write(data->regmap,
 				   EC_ADDR_GPU_FAN_SPEED_TABLE + i,
-				   FAN_TABLE_MAX_SPEED);
+				   default_gpu_curve[i].duty);
 		if (ret < 0)
 			return ret;
 	}
@@ -3383,6 +3391,12 @@ static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
 
 	switch (mode) {
 	case 0:	/* Full speed */
+		if (data->fan_mode == 3) {
+			ret = uniwill_fan_disable_custom_tables(data);
+			if (ret < 0)
+				return ret;
+		}
+
 		ret = regmap_set_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 				      FAN_MODE_BOOST);
 		if (ret < 0)
@@ -3395,6 +3409,12 @@ static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
 		if (!data->has_universal_fan_ctrl)
 			return -EOPNOTSUPP;
 
+		if (data->fan_mode == 3) {
+			ret = uniwill_fan_disable_custom_tables(data);
+			if (ret < 0)
+				return ret;
+		}
+
 		/*
 		 * Don't enable boost mode here. The EC briefly ramps fans
 		 * to full speed on boost entry. Defer boost activation to
@@ -3403,7 +3423,13 @@ static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
 		 */
 		data->fan_mode = 1;
 		return 0;
-	case 2:	/* Automatic */
+	case 2:	/* Automatic (EC firmware curves) */
+		if (data->fan_mode == 3) {
+			ret = uniwill_fan_disable_custom_tables(data);
+			if (ret < 0)
+				return ret;
+		}
+
 		ret = regmap_clear_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 					FAN_MODE_BOOST);
 		if (ret < 0)
@@ -3411,6 +3437,22 @@ static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
 
 		data->boost_active = false;
 		data->fan_mode = 2;
+		return 0;
+	case 3:	/* Custom auto (user-defined curves in 0x0F00-0x0F5F) */
+		if (!data->has_universal_fan_ctrl)
+			return -EOPNOTSUPP;
+
+		ret = regmap_clear_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+					FAN_MODE_BOOST);
+		if (ret < 0)
+			return ret;
+
+		ret = uniwill_fan_enable_custom_tables(data);
+		if (ret < 0)
+			return ret;
+
+		data->boost_active = false;
+		data->fan_mode = 3;
 		return 0;
 	default:
 		return -EINVAL;
@@ -5257,11 +5299,10 @@ static int uniwill_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * Initialise the fan curve tables with sensible defaults so that
-	 * manual mode can be enabled without prior auto_point programming.
-	 * Zone 0 is set to the current fan speed to avoid a sudden change
-	 * on the first mode 1 entry; zones 1-15 are populated with dummy
-	 * safety entries well beyond the normal operating temperature range.
+	 * Initialise the custom fan curve tables with the default balanced
+	 * curve so that custom auto mode (pwm_enable=3) can be activated
+	 * without prior auto_point programming. The EC ignores these
+	 * registers until ENABLE_UNIVERSAL_FAN_CTRL is explicitly set.
 	 */
 	if (data->has_universal_fan_ctrl) {
 		ret = uniwill_fan_init_tables(data);
@@ -5449,6 +5490,7 @@ static int uniwill_suspend_fan_mode(struct uniwill_data *data)
 		return regmap_clear_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 					 FAN_MODE_BOOST);
 	case 1:	/* Manual - disable custom tables before suspend */
+	case 3:	/* Custom auto - disable custom tables before suspend */
 		return uniwill_fan_disable_custom_tables(data);
 	default:
 		return 0;
@@ -5635,7 +5677,7 @@ static int uniwill_resume_custom_profile(struct uniwill_data *data)
 
 static int uniwill_resume_fan_mode(struct uniwill_data *data)
 {
-	int ret;
+	int i, ret;
 
 	switch (data->fan_mode) {
 	case 0:	/* Full speed - restore boost */
@@ -5657,13 +5699,35 @@ static int uniwill_resume_fan_mode(struct uniwill_data *data)
 		if (ret < 0)
 			return ret;
 
-		ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
-				      SPLIT_TABLES);
-		if (ret < 0)
-			return ret;
+		return uniwill_fan_enable_custom_tables(data);
+	case 3:	/* Custom auto - restore full fan curve and re-enable */
+		/*
+		 * All 96 fan table registers (temps + speeds) are volatile
+		 * and lost during sleep. Restore from regcache, then re-enable
+		 * the custom table control bits.
+		 */
+		for (i = 0; i < FAN_TABLE_ZONES; i++) {
+			regcache_sync_region(data->regmap,
+					     EC_ADDR_CPU_TEMP_END_TABLE + i,
+					     EC_ADDR_CPU_TEMP_END_TABLE + i);
+			regcache_sync_region(data->regmap,
+					     EC_ADDR_CPU_TEMP_START_TABLE + i,
+					     EC_ADDR_CPU_TEMP_START_TABLE + i);
+			regcache_sync_region(data->regmap,
+					     EC_ADDR_CPU_FAN_SPEED_TABLE + i,
+					     EC_ADDR_CPU_FAN_SPEED_TABLE + i);
+			regcache_sync_region(data->regmap,
+					     EC_ADDR_GPU_TEMP_END_TABLE + i,
+					     EC_ADDR_GPU_TEMP_END_TABLE + i);
+			regcache_sync_region(data->regmap,
+					     EC_ADDR_GPU_TEMP_START_TABLE + i,
+					     EC_ADDR_GPU_TEMP_START_TABLE + i);
+			regcache_sync_region(data->regmap,
+					     EC_ADDR_GPU_FAN_SPEED_TABLE + i,
+					     EC_ADDR_GPU_FAN_SPEED_TABLE + i);
+		}
 
-		return regmap_set_bits(data->regmap, EC_ADDR_AP_OEM_6,
-				       ENABLE_UNIVERSAL_FAN_CTRL);
+		return uniwill_fan_enable_custom_tables(data);
 	default:
 		return 0;
 	}
