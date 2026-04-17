@@ -383,6 +383,9 @@
 #define BATTERY_CHARGE_FULL_OVER_24H	BIT(3)
 #define BATTERY_ERM_STATUS_REACHED	BIT(4)
 
+#define EC_ADDR_COOLING_MODE		0x07C7
+#define COOLING_MODE_LC_ACTIVE		BIT(0)
+
 #define EC_ADDR_USB_C_POWER_PRIORITY	0x07CC
 #define USB_C_POWER_PRIORITY		BIT(7)
 
@@ -544,6 +547,7 @@ struct uniwill_data {
 		u8 fan_pwm_target;		/* Target fan PWM set via hwmon (0-255) */
 		u8 pump_pwm_target;		/* Target pump PWM set via hwmon (0-255) */
 		unsigned int fan_mode;		/* 0=full, 1=manual, 2=auto */
+		bool enable;			/* LC mode active (written to EC 0x07C7) */
 	} wc;
 };
 
@@ -771,6 +775,7 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_MODE_INDEX:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
+	case EC_ADDR_COOLING_MODE:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 	case EC_ADDR_FAN_SWITCH_SPEED:
 	case EC_ADDR_CPU_TEMP_END_TABLE ... EC_ADDR_CPU_TEMP_END_TABLE + 0xF:
@@ -855,6 +860,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_FAN_CTRL:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
+	case EC_ADDR_COOLING_MODE:
 	case EC_ADDR_MINI_LED_SUPPORT:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
 	case EC_ADDR_ADAPTER_CURRENT:
@@ -907,6 +913,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SSD_TEMP:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_MODE_INDEX:
+	case EC_ADDR_COOLING_MODE:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_CHARGE_CTRL_START:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
@@ -2790,6 +2797,36 @@ static ssize_t wc_fan_mode_show(struct device *dev, struct device_attribute *att
 	return sysfs_emit(buf, "%u\n", data->wc.fan_mode);
 }
 
+static ssize_t wc_enable_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", data->wc.enable);
+}
+
+static ssize_t wc_enable_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+
+	mutex_lock(&data->wc.lock);
+
+	ret = regmap_update_bits(data->regmap, EC_ADDR_COOLING_MODE,
+				 COOLING_MODE_LC_ACTIVE,
+				 enable ? COOLING_MODE_LC_ACTIVE : 0);
+	if (ret == 0)
+		data->wc.enable = enable;
+
+	mutex_unlock(&data->wc.lock);
+
+	return ret < 0 ? ret : count;
+}
+
 static DEVICE_ATTR_RW(wc_fan_rpm);
 static DEVICE_ATTR_RW(wc_pump_rpm);
 static DEVICE_ATTR_RW(wc_fan_pwm);
@@ -2797,6 +2834,7 @@ static DEVICE_ATTR_RW(wc_pump_pwm);
 static DEVICE_ATTR_RO(wc_fan_pwm_target);
 static DEVICE_ATTR_RO(wc_pump_pwm_target);
 static DEVICE_ATTR_RO(wc_fan_mode);
+static DEVICE_ATTR_RW(wc_enable);
 
 static struct attribute *uniwill_wc_attrs[] = {
 	&dev_attr_wc_fan_rpm.attr,
@@ -2806,6 +2844,7 @@ static struct attribute *uniwill_wc_attrs[] = {
 	&dev_attr_wc_fan_pwm_target.attr,
 	&dev_attr_wc_pump_pwm_target.attr,
 	&dev_attr_wc_fan_mode.attr,
+	&dev_attr_wc_enable.attr,
 	NULL
 };
 
