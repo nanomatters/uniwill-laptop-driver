@@ -186,6 +186,7 @@
 #define EC_ADDR_PL1_DEFAULT_BATTERYSAVER	0x07A7
 #define EC_ADDR_PL2_DEFAULT_BATTERYSAVER	0x07A8
 #define EC_ADDR_PL4_DEFAULT_BATTERYSAVER	0x07A9
+#define EC_ADDR_TAU_DEFAULT_BATTERYSAVER	0x07AA
 #define EC_ADDR_TCC_DEFAULT_GAMING	0x07D8
 #define EC_ADDR_TCC_DEFAULT_OFFICE	0x07D9
 #define EC_ADDR_TCC_DEFAULT_TURBO	0x07DA
@@ -351,6 +352,12 @@
 #define OVERBOOST			BIT(4)
 #define HIGH_POWER			BIT(7)
 
+#define EC_ADDR_MODE_INDEX		0x07AB
+#define MODE_INDEX_QUIET		0x00
+#define MODE_INDEX_BALANCED		0x01
+#define MODE_INDEX_PERFORMANCE		0x02
+#define MODE_INDEX_BATTERY_SAVER	0x03
+
 #define EC_ADDR_OEM_4			0x07A6
 #define OVERBOOST_DYN_TEMP_OFF		BIT(1)
 #define CHARGING_PROFILE_MASK		GENMASK(5, 4)
@@ -507,6 +514,7 @@ struct uniwill_data {
 	/* Per-profile default PL values read from EC firmware registers */
 	unsigned int tdp_defaults[4][3];	/* [profile_idx][pl_idx] */
 	unsigned int tdp_defaults_dc[3];	/* [pl_idx], used when on battery */
+	unsigned int tau_default_dc;		/* Duration/D-state default for battery saver */
 	bool has_battery_saver_defaults;
 	bool overboost_active;		/* True when performance profile is active (water cooler) */
 	unsigned int vrm_saved;		/* VRM current limit before overboost */
@@ -760,6 +768,7 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_TCC_OFFSET:
 	case EC_ADDR_VRM_CURRENT_LIMIT:
 	case EC_ADDR_MANUAL_FAN_CTRL:
+	case EC_ADDR_MODE_INDEX:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
@@ -827,6 +836,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL1_DEFAULT_BATTERYSAVER:
 	case EC_ADDR_PL2_DEFAULT_BATTERYSAVER:
 	case EC_ADDR_PL4_DEFAULT_BATTERYSAVER:
+	case EC_ADDR_TAU_DEFAULT_BATTERYSAVER:
 	case EC_ADDR_TCC_DEFAULT_GAMING:
 	case EC_ADDR_TCC_DEFAULT_OFFICE:
 	case EC_ADDR_TCC_DEFAULT_TURBO:
@@ -841,6 +851,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_TCC_OFFSET:
 	case EC_ADDR_SSD_TEMP:
 	case EC_ADDR_MANUAL_FAN_CTRL:
+	case EC_ADDR_MODE_INDEX:
 	case EC_ADDR_FAN_CTRL:
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
@@ -895,6 +906,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_TCC_OFFSET:
 	case EC_ADDR_SSD_TEMP:
 	case EC_ADDR_MANUAL_FAN_CTRL:
+	case EC_ADDR_MODE_INDEX:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_CHARGE_CTRL_START:
 	case EC_ADDR_USB_C_POWER_PRIORITY:
@@ -1756,13 +1768,16 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	if (regmap_read(data->regmap, EC_ADDR_PL4_DEFAULT_BATTERYSAVER, &value) == 0)
 		data->tdp_defaults_dc[2] = value;
 
+	if (regmap_read(data->regmap, EC_ADDR_TAU_DEFAULT_BATTERYSAVER, &value) == 0)
+		data->tau_default_dc = value;
+
 	if (data->tdp_defaults_dc[0] != 0x00 && data->tdp_defaults_dc[0] != 0xFF &&
 	    data->tdp_defaults_dc[1] != 0x00 && data->tdp_defaults_dc[1] != 0xFF &&
 	    data->tdp_defaults_dc[2] != 0x00 && data->tdp_defaults_dc[2] != 0xFF) {
 		data->has_battery_saver_defaults = true;
-		dev_dbg(data->dev, "TDP defaults (DC): %u/%u/%u\n",
+		dev_dbg(data->dev, "TDP defaults (DC): %u/%u/%u tau=%u\n",
 			data->tdp_defaults_dc[0], data->tdp_defaults_dc[1],
-			data->tdp_defaults_dc[2]);
+			data->tdp_defaults_dc[2], data->tau_default_dc);
 	}
 
 	if (data->has_tcc_offset) {
@@ -4093,6 +4108,24 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 
 	/* Track EC mode for Fn key cycling logic */
 	data->last_fan_ctrl = value;
+
+	/*
+	 * Write the mode index register. The EC and/or other firmware
+	 * consumers (e.g. the profile button LED, fan table selection)
+	 * reference this to determine the current operating mode.
+	 *
+	 * On battery power, use BatterySaver mode index (3) so the EC
+	 * selects its battery-optimized fan curves regardless of which
+	 * user profile is active. On AC, use the profile-based index.
+	 */
+	if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
+		ret = regmap_write(data->regmap, EC_ADDR_MODE_INDEX,
+				   MODE_INDEX_BATTERY_SAVER);
+	else
+		ret = regmap_write(data->regmap, EC_ADDR_MODE_INDEX,
+				   min_t(unsigned int, profile_idx, 2));
+	if (ret < 0)
+		return ret;
 
 	ret = uniwill_write_pl_values(data, profile_idx);
 	if (ret < 0)
