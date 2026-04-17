@@ -2664,6 +2664,10 @@ static const struct attribute_group uniwill_group = {
 	.attrs = uniwill_attrs,
 };
 
+/* Forward declarations for profile functions used in wc_enable_store */
+static int uniwill_profile_get(struct device *dev, enum platform_profile_option *profile);
+static int uniwill_profile_set(struct device *dev, enum platform_profile_option profile);
+
 /* Water cooler sysfs bridge attributes */
 
 static ssize_t wc_fan_rpm_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -2836,7 +2840,21 @@ static ssize_t wc_enable_store(struct device *dev, struct device_attribute *attr
 
 	mutex_unlock(&data->wc.lock);
 
-	return ret < 0 ? ret : count;
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * Re-apply the current profile so TDP values and overboost
+	 * adjust to the new cooling state immediately.
+	 */
+	if (data->pprof_dev) {
+		enum platform_profile_option cur;
+
+		if (uniwill_profile_get(data->pprof_dev, &cur) == 0)
+			uniwill_profile_set(data->pprof_dev, cur);
+	}
+
+	return count;
 }
 
 static DEVICE_ATTR_RW(wc_fan_rpm);
@@ -4128,10 +4146,12 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 	case PLATFORM_PROFILE_PERFORMANCE:
 		value = PROFILE_PERFORMANCE;
 		/*
-		 * On water-cooled devices, performance mode uses the maximum
-		 * TDP values and enables overboost (raised VRM current limit).
+		 * Water-cooled devices use maximum TDP values and overboost
+		 * only when the cooler is actively connected (wc.enable).
+		 * Without the cooler, use the conservative air-cooled TDP.
 		 */
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
+		    data->wc.enable)
 			profile_idx = 3;
 		else
 			profile_idx = 2;
@@ -4202,9 +4222,10 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		}
 	}
 
-	/* Enable overboost in performance mode on water-cooled devices */
+	/* Enable overboost in performance mode when water cooler is active */
 	if (profile == PLATFORM_PROFILE_PERFORMANCE && !data->overboost_active &&
-	    uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER)) {
+	    uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
+	    data->wc.enable) {
 		ret = uniwill_set_overboost(data, true);
 		if (ret < 0)
 			return ret;
