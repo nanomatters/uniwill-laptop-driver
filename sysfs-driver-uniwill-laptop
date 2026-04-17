@@ -364,3 +364,17 @@ Description:
 		Returns the EC firmware version as "major.minor" (e.g. "1.07").
 
 		Returns -ENODATA if the firmware version cannot be read.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/water_cooler/wc_enable
+Date:		April 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Enables or disables liquid cooling mode. Writing "1" activates liquid cooling by
+		setting the EC cooling mode register; writing "0" deactivates it. Toggling this
+		attribute also re-applies the current platform profile to adjust power limits and
+		overboost settings for the new cooling state.
+
+		Reading this file returns the current liquid cooling enable status.
+
+		This attribute is only available on devices with water cooler support.
