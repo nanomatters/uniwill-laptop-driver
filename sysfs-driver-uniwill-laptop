@@ -71,7 +71,7 @@ Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Allows userspace applications to enable or disable NVIDIA Dynamic Boost. When
 		enabled, the GPU may draw up to 25 additional watts from surplus CPU power headroom.
-		Writing "1" enables Dynamic Boost; writing "0" disables it. The driver enables
+		Writing "1" enables Dynamic Boost. Writing "0" disables it. The driver enables
 		Dynamic Boost by default. The setting is preserved across system suspend/resume.
 
 		Reading this file returns 1 if Dynamic Boost is currently enabled, 0 otherwise.
@@ -198,6 +198,24 @@ Description:
 
 		Reading this file returns the last reported fan RPM value.
 
+What:		/sys/bus/platform/devices/INOU0000:XX/silent_mode
+Date:		May 2026
+KernelVersion:	7.3
+Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
+Description:
+		Allows userspace applications to read and toggle the EC-level silent mode. When
+		active, the EC firmware enforces aggressively quiet fan curves and may cap power
+		limits independently of the OS-selected platform profile.
+
+		Writing "1"/"0" to this file toggles the silent mode state. The write only occurs
+		if the requested state differs from the current state since writing the trigger
+		register always flips the EC's internal state.
+
+		Reading this file returns "1" if silent mode is currently active, "0" otherwise.
+
+		This attribute is only visible on devices where the EC reports silent mode
+		capability via support byte 2 (0x0766) and platform profiles are supported.
+
 What:		/sys/bus/platform/devices/INOU0000:XX/wc/pump_rpm
 Date:		April 2026
 KernelVersion:	7.3
@@ -322,7 +340,7 @@ KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Controls the power state of the discrete NVIDIA GPU. Writing "1" powers the dGPU
-		on; writing "0" powers it off via WMI.
+		on. Writing "0" powers it off via WMI.
 
 		Reading this file returns "1" if the dGPU is present on the PCI bus, "0" otherwise.
 
@@ -373,7 +391,7 @@ KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Enables or disables liquid cooling mode. Writing "1" activates liquid cooling by
-		setting the EC cooling mode register; writing "0" deactivates it. Toggling this
+		setting the EC cooling mode register. Writing "0" deactivates it. Toggling this
 		attribute also re-applies the current platform profile to adjust power limits and
 		overboost settings for the new cooling state.
 

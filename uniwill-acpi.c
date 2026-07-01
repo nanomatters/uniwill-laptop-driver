@@ -19,7 +19,6 @@
 #include <linux/bits.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
-#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/device/driver.h>
@@ -124,6 +123,8 @@
 /* BIT(5) is also unset depending on the rfkill state (bluetooth?) */
 
 #define EC_ADDR_EC_SUB_VERSION		0x047D
+
+#define EC_ADDR_SILENT_MODE_STATUS	0x045B
 
 #define EC_ADDR_BAT_ALERT		0x0494
 
@@ -297,6 +298,10 @@
 
 #define EC_ADDR_ROMID_EXTRA_2		0x077F
 
+#define EC_ADDR_MODULE_ID_GPU		0x07D2
+
+#define EC_ADDR_MODULE_ID		0x07D3
+
 #define EC_ADDR_BIOS_OEM_2		0x0782
 #define FAN_V2_NEW			BIT(0)
 #define FAN_QKEY			BIT(1)
@@ -376,6 +381,7 @@
 #define EC_ADDR_SSD_TEMP		0x07D1
 
 #define EC_ADDR_UNIVERSAL_FAN_CTRL	0x07C5
+#define RAMFAN2_FAN_CURVE_CONTROL	GENMASK(7, 5)
 #define SPLIT_TABLES			BIT(7)
 
 #define EC_ADDR_AP_OEM_6		0x07C6
@@ -385,6 +391,7 @@
 
 #define EC_ADDR_COOLING_MODE		0x07C7
 #define COOLING_MODE_LC_ACTIVE		BIT(0)
+#define COOLING_MODE_FAN_CURVE_INIT	GENMASK(3, 2)
 
 #define EC_ADDR_USB_C_POWER_PRIORITY	0x07CC
 #define USB_C_POWER_PRIORITY		BIT(7)
@@ -417,6 +424,9 @@
 #define EC_ADDR_GPU_TEMP_START_TABLE	0x0F40
 
 #define EC_ADDR_GPU_FAN_SPEED_TABLE	0x0F50
+
+/* RamFan1.5 table status register for RamFan2 detection */
+#define EC_ADDR_RAMFAN1P5_TABLE_STATUS	0x0F5D
 
 /*
  * Those two registers technically allow for manual fan control,
@@ -464,6 +474,10 @@
 #define UNIWILL_FEATURE_CPU_TDP_CONTROL		BIT(15)
 #define UNIWILL_FEATURE_WATER_COOLER		BIT(16)
 #define UNIWILL_FEATURE_GPU_MUX			BIT(17)
+/*
+ * 0x0786 is TCC only on universal fan control systems. On RamFan1 it is
+ * L1_PWM_DEFAULT_MYFAN3, so keep this feature off for older descriptors.
+ */
 #define UNIWILL_FEATURE_TCC_OFFSET		BIT(18)
 
 #define WC_STALE_TIMEOUT_MS	5000
@@ -512,10 +526,11 @@ struct uniwill_data {
 	struct mutex usb_c_power_priority_lock; /* Protects dependent bit write and state safe */
 	enum usb_c_power_priority_options last_usb_c_power_priority_option;
 	unsigned int num_profiles;
-	unsigned int last_fan_ctrl;
+	unsigned int last_profile_ctrl;
 	struct device *pprof_dev;	/* platform_profile class device */
 	bool custom_profile_mode_needed;
 	bool has_universal_fan_ctrl;
+	bool has_ramfan2;		/* RamFan2: F2/F3 extended fan tables present */
 	bool has_double_pl4;
 	unsigned int tdp_max[3];
 	/* Per-profile default PL values read from EC firmware registers */
@@ -535,6 +550,7 @@ struct uniwill_data {
 	bool has_gpu_mux;
 	bool has_tcc_offset;
 	bool has_ssd_temp;
+	bool has_silent_mode;		/* EC supports silent mode toggle via 0x0767 bit 3 */
 	unsigned int tcc_defaults[3];	/* [0]=quiet, [1]=balanced, [2]=performance */
 	bool dynamic_boost_enable;
 	unsigned int ctgp_max;
@@ -803,6 +819,7 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_GPU_TEMP:
 	case EC_ADDR_EC_VERSION:
 	case EC_ADDR_EC_SUB_VERSION:
+	case EC_ADDR_SILENT_MODE_STATUS:
 	case EC_ADDR_MAIN_FAN_RPM_1:
 	case EC_ADDR_MAIN_FAN_RPM_2:
 	case EC_ADDR_SECOND_FAN_RPM_1:
@@ -899,6 +916,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_GPU_TEMP:
 	case EC_ADDR_EC_VERSION:
 	case EC_ADDR_EC_SUB_VERSION:
+	case EC_ADDR_SILENT_MODE_STATUS:
 	case EC_ADDR_MAIN_FAN_RPM_1:
 	case EC_ADDR_MAIN_FAN_RPM_2:
 	case EC_ADDR_SECOND_FAN_RPM_1:
@@ -921,6 +939,9 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SSD_TEMP:
 	case EC_ADDR_MANUAL_FAN_CTRL:
 	case EC_ADDR_MODE_INDEX:
+	/* The EC may clear custom fan gates on profile/power changes. */
+	case EC_ADDR_UNIVERSAL_FAN_CTRL:
+	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_COOLING_MODE:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_CHARGE_CTRL_START:
@@ -1039,6 +1060,56 @@ static ssize_t super_key_enable_show(struct device *dev, struct device_attribute
 }
 
 static DEVICE_ATTR_RW(super_key_enable);
+
+static ssize_t silent_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_SILENT_MODE_STATUS, &value);
+	if (ret < 0)
+		return ret;
+
+	/* 0xFF means this EC does not expose the status register. */
+	if (value == 0xFF)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "%u\n", value ? 1 : 0);
+}
+
+static ssize_t silent_mode_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_SILENT_MODE_STATUS, &value);
+	if (ret < 0)
+		return ret;
+
+	if (value == 0xFF)
+		return -ENODATA;
+
+	/* 0x0767 bit 3 is a toggle, so write only on state changes. */
+	if (enable == !!value)
+		return count;
+
+	ret = regmap_write_bits(data->regmap, EC_ADDR_TRIGGER,
+				TRIGGER_SILENT_MODE, TRIGGER_SILENT_MODE);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(silent_mode);
 
 static ssize_t touchpad_toggle_enable_store(struct device *dev, struct device_attribute *attr,
 					    const char *buf, size_t count)
@@ -1713,7 +1784,7 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	 * Table layout:
 	 *   Index 0: PL1 max (watts)
 	 *   Index 1: PL2 max (watts)
-	 *   Index 2: PL4 max (raw; doubled if has_double_pl4)
+	 *   Index 2: PL4 max (raw, doubled if has_double_pl4)
 	 */
 	ret = uniwill_smrw_read_tdp_limits(data);
 	if (ret < 0)
@@ -1932,7 +2003,7 @@ out:
  *
  * The OEM control center (GCU) sets ApExist=1 and ApUse=1 on first
  * launch to tell the EC firmware that a management application
- * is present.  Without these flags, the EC may not delegate profile
+ * is present. Without these flags, the EC may not delegate profile
  * button LED control to the OS driver.
  */
 static void uniwill_set_app_presence(struct uniwill_data *data)
@@ -2235,6 +2306,10 @@ static ssize_t tcc_temp_store(struct device *dev,
 	u8 value;
 	int ret;
 
+	/* On RamFan1, 0x0786 is a fan PWM default. */
+	if (!data->has_universal_fan_ctrl)
+		return -EOPNOTSUPP;
+
 	ret = kstrtouint(buf, 10, &temp);
 	if (ret < 0)
 		return ret;
@@ -2279,6 +2354,67 @@ static ssize_t ec_firmware_version_show(struct device *dev,
 }
 
 static DEVICE_ATTR_RO(ec_firmware_version);
+
+static ssize_t project_id_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "0x%02x\n", data->project_id);
+}
+
+static DEVICE_ATTR_RO(project_id);
+
+static ssize_t module_id_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int gpu, cpu;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_MODULE_ID_GPU, &gpu);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_MODULE_ID, &cpu);
+	if (ret < 0)
+		return ret;
+
+	if (gpu == 0xFF || cpu == 0xFF)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "0x%02x (GPU) / 0x%02x (CPU)\n", gpu, cpu);
+}
+
+static DEVICE_ATTR_RO(module_id);
+
+static ssize_t rom_id_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int v;
+	u8 romid[ROMID_LENGTH];
+	int i, ret;
+
+	for (i = 0; i < ROMID_LENGTH; i++) {
+		ret = regmap_read(data->regmap, EC_ADDR_ROMID_START + i, &v);
+		if (ret < 0)
+			return ret;
+		romid[i] = v;
+	}
+
+	/* All 0xFF means the ROM region is unmapped on this EC */
+	for (i = 0; i < ROMID_LENGTH; i++) {
+		if (romid[i] != 0xFF)
+			break;
+	}
+	if (i == ROMID_LENGTH)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "%*phN\n", ROMID_LENGTH, romid);
+}
+
+static DEVICE_ATTR_RO(rom_id);
 
 /*
  * Check if an NVIDIA dGPU is present on the PCI bus.
@@ -2493,13 +2629,14 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_rainbow_animation.attr,
 	&dev_attr_breathing_in_suspend.attr,
 	/* Misc */
-	&dev_attr_ec_firmware_version.attr,
 	&dev_attr_usb_c_power_priority.attr,
 	&dev_attr_ac_auto_boot.attr,
 	&dev_attr_usb_powershare_high.attr,
 	/* Display-related */
 	&dev_attr_mini_led_local_dimming.attr,
 	&dev_attr_fan_switch_speed.attr,
+	/* Silent mode toggle */
+	&dev_attr_silent_mode.attr,
 	NULL
 };
 
@@ -2529,9 +2666,6 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 			return attr->mode;
 	}
 
-	if (attr == &dev_attr_ec_firmware_version.attr)
-		return attr->mode;
-
 	if (attr == &dev_attr_usb_c_power_priority.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_USB_C_POWER_PRIORITY))
 			return attr->mode;
@@ -2554,6 +2688,11 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 
 	if (attr == &dev_attr_fan_switch_speed.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_silent_mode.attr) {
+		if (data->has_silent_mode)
 			return attr->mode;
 	}
 
@@ -2685,6 +2824,40 @@ static const struct attribute_group uniwill_dgpu_group = {
 	.name = "dgpu",
 	.is_visible = uniwill_dgpu_is_visible,
 	.attrs = uniwill_dgpu_attrs,
+};
+
+/* Firmware info sysfs attributes under info/ */
+
+static struct attribute *uniwill_info_attrs[] = {
+	&dev_attr_ec_firmware_version.attr,
+	&dev_attr_project_id.attr,
+	&dev_attr_module_id.attr,
+	&dev_attr_rom_id.attr,
+	NULL
+};
+
+static umode_t uniwill_info_is_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	if (attr == &dev_attr_ec_firmware_version.attr ||
+	    attr == &dev_attr_project_id.attr)
+		return attr->mode;
+
+	if (attr == &dev_attr_module_id.attr ||
+	    attr == &dev_attr_rom_id.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL))
+			return attr->mode;
+	}
+
+	return 0;
+}
+
+static const struct attribute_group uniwill_info_group = {
+	.name = "info",
+	.is_visible = uniwill_info_is_visible,
+	.attrs = uniwill_info_attrs,
 };
 
 /* Forward declarations for profile functions used in enable_store */
@@ -2922,6 +3095,7 @@ static const struct attribute_group *uniwill_groups[] = {
 	&uniwill_group,
 	&uniwill_cpu_group,
 	&uniwill_dgpu_group,
+	&uniwill_info_group,
 	&uniwill_wc_group,
 	NULL
 };
@@ -2973,7 +3147,16 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		switch (attr) {
 		case hwmon_temp_input:
 		case hwmon_temp_label:
+			return 0444;
 		case hwmon_temp_max:
+			/*
+			 * On RamFan1, 0x0786 is a fan PWM default. Only expose
+			 * writes after the runtime fan-control gate has passed.
+			 */
+			if (feature == UNIWILL_FEATURE_CPU_TEMP &&
+			    uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL) &&
+			    data->has_universal_fan_ctrl)
+				return 0644;
 			return 0444;
 		default:
 			return 0;
@@ -3026,7 +3209,7 @@ static umode_t uniwill_is_visible(const void *drvdata, enum hwmon_sensor_types t
 		}
 	case hwmon_power:
 		switch (channel) {
-		case 0: /* System power — needs GPU (discrete GPU implies full power monitoring) */
+		case 0: /* System power */
 			feature = UNIWILL_FEATURE_GPU_TEMP;
 			break;
 		case 1: /* GPU power allocation */
@@ -3220,14 +3403,14 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 			/* hwmon power is in microwatts */
 			*val = (long)((value_hi << 8) | value) * 1000000;
 			return 0;
-		case 1: /* GPU power allocation (raw × 8 = watts) */
+		case 1: /* GPU power allocation (raw * 8 = watts) */
 			ret = regmap_read(data->regmap, EC_ADDR_GPU_POWER_ALLOC, &value);
 			if (ret < 0)
 				return ret;
 
 			*val = (long)value * 8 * 1000000;
 			return 0;
-		case 2: /* Thermal budget remaining (raw × 8 = watts) */
+		case 2: /* Thermal budget remaining (raw * 8 = watts) */
 			ret = regmap_read(data->regmap, EC_ADDR_THERMAL_BUDGET, &value);
 			if (ret < 0)
 				return ret;
@@ -3239,12 +3422,12 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 		}
 	case hwmon_curr:
 		switch (channel) {
-		case 0: /* Adapter current (raw ÷ 10 = amps) */
+		case 0: /* Adapter current (raw / 10 = amps) */
 			ret = regmap_read(data->regmap, EC_ADDR_ADAPTER_CURRENT, &value);
 			if (ret < 0)
 				return ret;
 
-			/* hwmon current is in milliamps; raw ÷ 10 = amps → raw × 100 = mA */
+			/* hwmon current is in milliamps: raw / 10 A = raw * 100 mA. */
 			*val = (long)value * 100;
 			return 0;
 		default:
@@ -3372,9 +3555,49 @@ static int uniwill_fan_init_tables(struct uniwill_data *data)
 		if (ret < 0)
 			return ret;
 
-		ret = regmap_write(data->regmap,
-				   EC_ADDR_GPU_FAN_SPEED_TABLE + i,
-				   default_gpu_curve[i].duty);
+			/* On RamFan2, 0x0F50 is F2 CPU Temp Up, not GPU Duty. */
+		if (!data->has_ramfan2) {
+			ret = regmap_write(data->regmap,
+					   EC_ADDR_GPU_FAN_SPEED_TABLE + i,
+					   default_gpu_curve[i].duty);
+			if (ret < 0)
+				return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int uniwill_fan_sync_table(struct uniwill_data *data, unsigned int base)
+{
+	int i, ret;
+
+	for (i = 0; i < FAN_TABLE_ZONES; i++) {
+		ret = regcache_sync_region(data->regmap, base + i, base + i);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int uniwill_fan_sync_custom_tables(struct uniwill_data *data)
+{
+	static const unsigned int bases[] = {
+		EC_ADDR_CPU_TEMP_END_TABLE,
+		EC_ADDR_CPU_TEMP_START_TABLE,
+		EC_ADDR_CPU_FAN_SPEED_TABLE,
+		EC_ADDR_GPU_TEMP_END_TABLE,
+		EC_ADDR_GPU_TEMP_START_TABLE,
+		EC_ADDR_GPU_FAN_SPEED_TABLE,
+	};
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(bases); i++) {
+		if (data->has_ramfan2 && bases[i] == EC_ADDR_GPU_FAN_SPEED_TABLE)
+			continue;
+
+		ret = uniwill_fan_sync_table(data, bases[i]);
 		if (ret < 0)
 			return ret;
 	}
@@ -3386,13 +3609,24 @@ static int uniwill_fan_enable_custom_tables(struct uniwill_data *data)
 {
 	int ret;
 
-	/* Enable split tables so CPU and GPU fans use separate curves */
-	ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
-			      SPLIT_TABLES);
+	if (data->has_ramfan2) {
+		ret = regmap_update_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
+					 RAMFAN2_FAN_CURVE_CONTROL,
+					 RAMFAN2_FAN_CURVE_CONTROL);
+		if (ret < 0)
+			return ret;
+
+		/* OEM fan-curve parameter. Preserve unrelated bits. */
+		ret = regmap_set_bits(data->regmap, EC_ADDR_COOLING_MODE,
+				      COOLING_MODE_FAN_CURVE_INIT);
+	} else {
+		ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
+				      SPLIT_TABLES);
+	}
 	if (ret < 0)
 		return ret;
 
-	/* Enable custom fan tables */
+	/* Latch the already-written table. */
 	return regmap_set_bits(data->regmap, EC_ADDR_AP_OEM_6,
 			       ENABLE_UNIVERSAL_FAN_CTRL);
 }
@@ -3407,7 +3641,16 @@ static int uniwill_fan_disable_custom_tables(struct uniwill_data *data)
 	if (ret < 0)
 		return ret;
 
-	/* Disable split tables */
+	if (data->has_ramfan2) {
+		ret = regmap_clear_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
+					RAMFAN2_FAN_CURVE_CONTROL);
+		if (ret < 0)
+			return ret;
+
+		return regmap_clear_bits(data->regmap, EC_ADDR_COOLING_MODE,
+					 COOLING_MODE_FAN_CURVE_INIT);
+	}
+
 	return regmap_clear_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
 				 SPLIT_TABLES);
 }
@@ -3457,8 +3700,9 @@ static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
 				return ret;
 		}
 
-		ret = regmap_clear_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-					FAN_MODE_BOOST);
+		ret = regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+					 PROFILE_MODE_MASK | FAN_MODE_BOOST,
+					 data->last_profile_ctrl & PROFILE_MODE_MASK);
 		if (ret < 0)
 			return ret;
 
@@ -3469,8 +3713,9 @@ static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
 		if (!data->has_universal_fan_ctrl)
 			return -EOPNOTSUPP;
 
-		ret = regmap_clear_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-					FAN_MODE_BOOST);
+		ret = regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+					 PROFILE_MODE_MASK | FAN_MODE_BOOST,
+					 data->last_profile_ctrl & PROFILE_MODE_MASK);
 		if (ret < 0)
 			return ret;
 
@@ -3501,9 +3746,8 @@ static int uniwill_set_pwm(struct uniwill_data *data, int channel, long val)
 
 	/*
 	 * Enforce minimum fan-on speed. Values below half the minimum
-	 * threshold are treated as fan-off (0); values between half-min
-	 * and min are snapped up to the minimum on-speed to prevent
-	 * the fan from stalling.
+	 * threshold are treated as fan-off (0). Values between half-min and
+	 * min are snapped up to the minimum on-speed to prevent stalls.
 	 */
 	fan_min = FAN_ON_MIN_SPEED_PERCENT * PWM_MAX / 100;
 	if (ec_val < fan_min / 2)
@@ -3559,6 +3803,27 @@ static int uniwill_write(struct device *dev, enum hwmon_sensor_types type, u32 a
 	struct uniwill_data *data = dev_get_drvdata(dev);
 
 	switch (type) {
+	case hwmon_temp:
+		switch (attr) {
+		case hwmon_temp_max:
+				/*
+				 * 0x0786 is safe to write only after the
+				 * runtime fan-control gate has passed.
+				 */
+			if (channel != 0)
+				return -EOPNOTSUPP;
+			if (!data->has_universal_fan_ctrl)
+				return -EOPNOTSUPP;
+
+			val /= MILLIDEGREE_PER_DEGREE;
+			if (val < 60 || val > TEMP_LIMIT_TJMAX)
+				return -EINVAL;
+
+			return regmap_write(data->regmap, EC_ADDR_TCC_OFFSET,
+					    BIT(7) | (TEMP_LIMIT_TJMAX - val));
+		default:
+			return -EOPNOTSUPP;
+		}
 	case hwmon_pwm:
 		switch (attr) {
 		case hwmon_pwm_enable:
@@ -3758,7 +4023,7 @@ static ssize_t uniwill_auto_point_temp_hyst_store(struct device *dev,
 
 /*
  * Macro generating the three SENSOR_DEVICE_ATTR_2 declarations for one
- * (fan, zone) pair.  _fn is 1-based (matches the sysfs "pwmN" index),
+ * (fan, zone) pair. _fn is 1-based (matches the sysfs "pwmN" index),
  * _zn is 1-based (matches the sysfs "auto_pointM" index).
  */
 #define UNIWILL_AUTO_POINT_ATTRS(_fn, _zn)					\
@@ -3853,26 +4118,24 @@ static umode_t uniwill_auto_point_is_visible(struct kobject *kobj,
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	const struct sensor_device_attribute_2 *sda =
 		container_of(attr, struct sensor_device_attribute_2, dev_attr.attr);
-	unsigned int fan_feature;
-
 	if (!data->has_universal_fan_ctrl)
 		return 0;
 
 	switch (sda->nr) {
 	case 0:
-		fan_feature = UNIWILL_FEATURE_PRIMARY_FAN;
-		break;
+		/* F1 CPU is visible on all universal-fan-ctrl models. */
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN))
+			return attr->mode;
+		return 0;
 	case 1:
-		fan_feature = UNIWILL_FEATURE_SECONDARY_FAN;
-		break;
+		/* Hide F1 GPU on RamFan2. 0x0F50 is F2 CPU Temp Up there. */
+		if (!data->has_ramfan2 &&
+		    uniwill_device_supports(data, UNIWILL_FEATURE_SECONDARY_FAN))
+			return attr->mode;
+		return 0;
 	default:
 		return 0;
 	}
-
-	if (uniwill_device_supports(data, fan_feature))
-		return attr->mode;
-
-	return 0;
 }
 
 static const struct attribute_group uniwill_auto_point_group = {
@@ -4005,6 +4268,20 @@ static bool uniwill_has_universal_fan_ctrl(struct uniwill_data *data)
 		return false;
 
 	return !!(value & UNIVERSAL_FAN_CTRL);
+}
+
+/* RamFan2 returns a valid byte here. Older tables read 0xff. */
+static bool uniwill_has_ramfan2(struct uniwill_data *data)
+{
+	unsigned int val;
+
+	if (!data->has_universal_fan_ctrl)
+		return false;
+
+	if (regmap_read(data->regmap, EC_ADDR_RAMFAN1P5_TABLE_STATUS, &val) < 0)
+		return false;
+
+	return val != 0xFF;
 }
 
 /*
@@ -4247,7 +4524,7 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		return ret;
 
 	/* Track EC mode for Fn key cycling logic */
-	data->last_fan_ctrl = value;
+	data->last_profile_ctrl = value;
 
 	/*
 	 * Write the mode index register. The EC and/or other firmware
@@ -4275,13 +4552,7 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		unsigned int tcc_idx = min_t(unsigned int, profile_idx, 2);
 		unsigned int tcc_val = data->tcc_defaults[tcc_idx];
 
-		/*
-		 * The EC TCC register (APTC/APTN at 0x0786) takes a 7-bit
-		 * temperature target in °C, not an Intel-style TCC offset.
-		 * DSDT confirms this: it writes values like 0x5A (90°C) and
-		 * 0x5F (95°C) directly.  The EC default registers 0x07D8-DA
-		 * store the same kind of temperature targets per profile.
-		 */
+		/* Per-profile defaults are absolute targets in C. */
 		if (tcc_val != 0 && tcc_val != 0xFF) {
 			tcc_val &= TCC_OFFSET_VALUE_MASK;
 			ret = regmap_write(data->regmap, EC_ADDR_TCC_OFFSET,
@@ -4296,6 +4567,16 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 	    uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
 	    data->wc.enable) {
 		ret = uniwill_set_overboost(data, true);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (data->fan_mode == 3) {
+		ret = uniwill_fan_sync_custom_tables(data);
+		if (ret < 0)
+			return ret;
+
+		ret = uniwill_fan_enable_custom_tables(data);
 		if (ret < 0)
 			return ret;
 	}
@@ -4363,7 +4644,7 @@ static int uniwill_profile_init(struct uniwill_data *data)
 	 */
 	regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 			   PROFILE_MODE_MASK, PROFILE_BALANCED);
-	data->last_fan_ctrl = PROFILE_BALANCED;
+	data->last_profile_ctrl = PROFILE_BALANCED;
 	uniwill_write_pl_values(data, 1);
 
 	pprof = devm_platform_profile_register(data->dev, "uniwill-platform-profile",
@@ -5313,8 +5594,18 @@ static int uniwill_probe(struct platform_device *pdev)
 	/* TCC offset: gated behind descriptor flag, no runtime detection needed */
 	data->has_tcc_offset = uniwill_device_supports(data, UNIWILL_FEATURE_TCC_OFFSET);
 
+	/* Silent mode needs profiles. EC support is 0x0766 bit 0. */
+	if (data->num_profiles > 0) {
+		unsigned int sil_val;
+
+		ret = regmap_read(data->regmap, EC_ADDR_SUPPORT_2, &sil_val);
+		if (ret == 0 && (sil_val & SILENT_MODE))
+			data->has_silent_mode = true;
+	}
+
 	/* Auto-detect universal fan control support */
 	data->has_universal_fan_ctrl = uniwill_has_universal_fan_ctrl(data);
+	data->has_ramfan2 = uniwill_has_ramfan2(data);
 	data->fan_mode = 2;
 
 	/* Initialise water cooler tunnel state */
@@ -5487,14 +5778,18 @@ static int uniwill_suspend_nvidia_ctgp(struct uniwill_data *data)
 
 static int uniwill_suspend_profile(struct uniwill_data *data)
 {
+	unsigned int value;
+	int ret;
+
 	if (data->num_profiles == 0)
 		return 0;
 
-	/*
-	 * Save the current fan control mode to restore it during resume.
-	 * This register is volatile since the EC can change it.
-	 */
-	return regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &data->last_fan_ctrl);
+	ret = regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &value);
+	if (ret < 0)
+		return ret;
+
+	data->last_profile_ctrl = value & PROFILE_MODE_MASK;
+	return 0;
 }
 
 static int uniwill_suspend_custom_profile(struct uniwill_data *data)
@@ -5661,7 +5956,7 @@ static int uniwill_resume_profile(struct uniwill_data *data)
 	if (data->num_profiles == 0)
 		return 0;
 
-	switch (data->last_fan_ctrl & PROFILE_MODE_MASK) {
+	switch (data->last_profile_ctrl & PROFILE_MODE_MASK) {
 	case PROFILE_QUIET:
 		profile_idx = 0;
 		break;
@@ -5678,7 +5973,8 @@ static int uniwill_resume_profile(struct uniwill_data *data)
 	 * may only apply PL writes when the target profile is active.
 	 */
 	ret = regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-				 PROFILE_MODE_MASK, data->last_fan_ctrl);
+				 PROFILE_MODE_MASK,
+				 data->last_profile_ctrl & PROFILE_MODE_MASK);
 	if (ret < 0)
 		return ret;
 
@@ -5704,7 +6000,7 @@ static int uniwill_resume_custom_profile(struct uniwill_data *data)
 
 static int uniwill_resume_fan_mode(struct uniwill_data *data)
 {
-	int i, ret;
+	int ret;
 
 	switch (data->fan_mode) {
 	case 0:	/* Full speed - restore boost */
@@ -5721,38 +6017,18 @@ static int uniwill_resume_fan_mode(struct uniwill_data *data)
 		if (ret < 0)
 			return ret;
 
-		ret = regmap_write(data->regmap, EC_ADDR_GPU_FAN_SPEED_TABLE,
-				   data->last_fan_pwm[1]);
-		if (ret < 0)
-			return ret;
+		if (!data->has_ramfan2) {
+			ret = regmap_write(data->regmap, EC_ADDR_GPU_FAN_SPEED_TABLE,
+					   data->last_fan_pwm[1]);
+			if (ret < 0)
+				return ret;
+		}
 
 		return uniwill_fan_enable_custom_tables(data);
 	case 3:	/* Custom auto - restore full fan curve and re-enable */
-		/*
-		 * All 96 fan table registers (temps + speeds) are volatile
-		 * and lost during sleep. Restore from regcache, then re-enable
-		 * the custom table control bits.
-		 */
-		for (i = 0; i < FAN_TABLE_ZONES; i++) {
-			regcache_sync_region(data->regmap,
-					     EC_ADDR_CPU_TEMP_END_TABLE + i,
-					     EC_ADDR_CPU_TEMP_END_TABLE + i);
-			regcache_sync_region(data->regmap,
-					     EC_ADDR_CPU_TEMP_START_TABLE + i,
-					     EC_ADDR_CPU_TEMP_START_TABLE + i);
-			regcache_sync_region(data->regmap,
-					     EC_ADDR_CPU_FAN_SPEED_TABLE + i,
-					     EC_ADDR_CPU_FAN_SPEED_TABLE + i);
-			regcache_sync_region(data->regmap,
-					     EC_ADDR_GPU_TEMP_END_TABLE + i,
-					     EC_ADDR_GPU_TEMP_END_TABLE + i);
-			regcache_sync_region(data->regmap,
-					     EC_ADDR_GPU_TEMP_START_TABLE + i,
-					     EC_ADDR_GPU_TEMP_START_TABLE + i);
-			regcache_sync_region(data->regmap,
-					     EC_ADDR_GPU_FAN_SPEED_TABLE + i,
-					     EC_ADDR_GPU_FAN_SPEED_TABLE + i);
-		}
+		ret = uniwill_fan_sync_custom_tables(data);
+		if (ret < 0)
+			return ret;
 
 		return uniwill_fan_enable_custom_tables(data);
 	default:
@@ -6618,6 +6894,14 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 		.driver_data = &x6fr5xxy_descriptor,
 	},
 	{
+		.ident = "PCSpecialist X6FR559Y",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "PCSpecialist"),
+			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6FR559Y"),
+		},
+		.driver_data = &x6fr5xxy_descriptor,
+	},
+	{
 		.ident = "TUXEDO Book BA15 Gen10 AMD",
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "TUXEDO"),
@@ -6682,10 +6966,14 @@ static int __init uniwill_init(void)
 	}
 
 	if (force) {
-		/* Assume that the device supports all features except the charge limit and GPU MUX */
+		/*
+		 * Forced probing still avoids registers that can map to
+		 * unrelated EC state on unknown hardware.
+		 */
 		device_descriptor.features = UINT_MAX & ~(UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT |
 							  UNIWILL_FEATURE_GPU_MUX |
-							  UNIWILL_FEATURE_TCC_OFFSET);
+							  UNIWILL_FEATURE_TCC_OFFSET |
+							  UNIWILL_FEATURE_CPU_TDP_CONTROL);
 		/* Some models only support 3 brightness levels */
 		device_descriptor.kbd_led_max_brightness = 4;
 		/* Some models only support 36 brightness levels per color component */
