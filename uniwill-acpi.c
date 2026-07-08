@@ -1396,7 +1396,7 @@ static int uniwill_nvidia_ctgp_init(struct uniwill_data *data)
 	return 0;
 }
 
-static int uniwill_performance_profile_active(struct uniwill_data *data)
+static int uniwill_read_profile_mode(struct uniwill_data *data, unsigned int *profile)
 {
 	unsigned int value;
 	int ret;
@@ -1405,31 +1405,37 @@ static int uniwill_performance_profile_active(struct uniwill_data *data)
 	if (ret < 0)
 		return ret;
 
-	return (value & PROFILE_MODE_MASK) == PROFILE_PERFORMANCE;
+	*profile = value & PROFILE_MODE_MASK;
+	return 0;
 }
 
 static int uniwill_current_pl_max(struct uniwill_data *data,
 				  unsigned int pl_idx, unsigned int *value);
+static int uniwill_current_pl_max_for_profile(struct uniwill_data *data,
+					      unsigned int profile,
+					      unsigned int pl_idx,
+					      unsigned int *value);
 
 static ssize_t pl1_store(struct device *dev, struct device_attribute *attr,
 			 const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int profile;
 	unsigned int value;
 	unsigned int max;
 	int ret;
 
-	ret = uniwill_performance_profile_active(data);
+	ret = uniwill_read_profile_mode(data, &profile);
 	if (ret < 0)
 		return ret;
-	if (!ret)
+	if (profile != PROFILE_PERFORMANCE)
 		return -EACCES;
 
 	ret = kstrtouint(buf, 0, &value);
 	if (ret < 0)
 		return ret;
 
-	ret = uniwill_current_pl_max(data, 0, &max);
+	ret = uniwill_current_pl_max_for_profile(data, profile, 0, &max);
 	if (ret < 0)
 		return ret;
 
@@ -1479,21 +1485,22 @@ static ssize_t pl2_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int profile;
 	unsigned int value;
 	unsigned int max;
 	int ret;
 
-	ret = uniwill_performance_profile_active(data);
+	ret = uniwill_read_profile_mode(data, &profile);
 	if (ret < 0)
 		return ret;
-	if (!ret)
+	if (profile != PROFILE_PERFORMANCE)
 		return -EACCES;
 
 	ret = kstrtouint(buf, 0, &value);
 	if (ret < 0)
 		return ret;
 
-	ret = uniwill_current_pl_max(data, 1, &max);
+	ret = uniwill_current_pl_max_for_profile(data, profile, 1, &max);
 	if (ret < 0)
 		return ret;
 
@@ -1543,22 +1550,23 @@ static ssize_t pl4_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int profile;
 	unsigned int value;
 	unsigned int max;
 	u8 ec_value;
 	int ret;
 
-	ret = uniwill_performance_profile_active(data);
+	ret = uniwill_read_profile_mode(data, &profile);
 	if (ret < 0)
 		return ret;
-	if (!ret)
+	if (profile != PROFILE_PERFORMANCE)
 		return -EACCES;
 
 	ret = kstrtouint(buf, 0, &value);
 	if (ret < 0)
 		return ret;
 
-	ret = uniwill_current_pl_max(data, 2, &max);
+	ret = uniwill_current_pl_max_for_profile(data, profile, 2, &max);
 	if (ret < 0)
 		return ret;
 
@@ -4601,20 +4609,15 @@ static bool uniwill_is_on_battery(struct uniwill_data *data)
 	return !!(value & BAT_DISCHARGING);
 }
 
-static int uniwill_current_pl_max(struct uniwill_data *data,
-				  unsigned int pl_idx, unsigned int *value)
+static int uniwill_current_pl_max_for_profile(struct uniwill_data *data,
+					      unsigned int profile,
+					      unsigned int pl_idx,
+					      unsigned int *value)
 {
-	unsigned int profile;
-	int ret;
-
 	if (pl_idx >= 3)
 		return -EINVAL;
 
-	ret = regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &profile);
-	if (ret < 0)
-		return ret;
-
-	switch (profile & PROFILE_MODE_MASK) {
+	switch (profile) {
 	case PROFILE_QUIET:
 		if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
 			*value = data->tdp_defaults_dc[pl_idx];
@@ -4637,6 +4640,19 @@ static int uniwill_current_pl_max(struct uniwill_data *data,
 			*value = data->tdp_defaults[1][pl_idx];
 		return 0;
 	}
+}
+
+static int uniwill_current_pl_max(struct uniwill_data *data,
+				  unsigned int pl_idx, unsigned int *value)
+{
+	unsigned int profile;
+	int ret;
+
+	ret = uniwill_read_profile_mode(data, &profile);
+	if (ret < 0)
+		return ret;
+
+	return uniwill_current_pl_max_for_profile(data, profile, pl_idx, value);
 }
 
 static int uniwill_write_pl_values(struct uniwill_data *data, int profile_idx)
