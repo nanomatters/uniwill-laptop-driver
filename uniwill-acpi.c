@@ -114,9 +114,10 @@
 #define EC_ADDR_SCREEN_STATUS		0x0466
 #define SCREEN_SUSPENDED		BIT(6)
 
+/* OEM ECSpec exposes second fan byte1/byte2 as 0x046C/0x046B. */
 #define EC_ADDR_SECOND_FAN_RPM_1	0x046C
 
-#define EC_ADDR_SECOND_FAN_RPM_2	0x046D
+#define EC_ADDR_SECOND_FAN_RPM_2	0x046B
 
 #define EC_ADDR_DEVICE_STATUS		0x047B
 #define WIFI_STATUS_ON			BIT(7)
@@ -381,7 +382,6 @@
 #define EC_ADDR_SSD_TEMP		0x07D1
 
 #define EC_ADDR_UNIVERSAL_FAN_CTRL	0x07C5
-#define RAMFAN2_FAN_CURVE_CONTROL	GENMASK(7, 5)
 #define SPLIT_TABLES			BIT(7)
 
 #define EC_ADDR_AP_OEM_6		0x07C6
@@ -391,7 +391,6 @@
 
 #define EC_ADDR_COOLING_MODE		0x07C7
 #define COOLING_MODE_LC_ACTIVE		BIT(0)
-#define COOLING_MODE_FAN_CURVE_INIT	GENMASK(3, 2)
 
 #define EC_ADDR_USB_C_POWER_PRIORITY	0x07CC
 #define USB_C_POWER_PRIORITY		BIT(7)
@@ -425,8 +424,14 @@
 
 #define EC_ADDR_GPU_FAN_SPEED_TABLE	0x0F50
 
-/* RamFan1.5 table status register for RamFan2 detection */
-#define EC_ADDR_RAMFAN1P5_TABLE_STATUS	0x0F5D
+/* RamFan1.5 reserves the tail of the GPU duty table for table control. */
+#define RAMFAN1P5_GPU_DUTY_ZONES	13
+
+#define EC_ADDR_RAMFAN1P5_TABLE_STATUS1	0x0F5D
+
+#define EC_ADDR_RAMFAN1P5_TABLE_STATUS2	0x0F5E
+
+#define EC_ADDR_RAMFAN1P5_TABLE_CTRL	0x0F5F
 
 /*
  * Those two registers technically allow for manual fan control,
@@ -487,6 +492,17 @@ enum usb_c_power_priority_options {
 	USB_C_POWER_PRIORITY_PERFORMANCE,
 };
 
+enum uniwill_fan_table_format {
+	/* Descriptor did not identify the table layout; probe conservatively. */
+	UNIWILL_FAN_TABLE_AUTO = 0,
+	/* Basic RamFan1-style 6-column table, all 16 GPU duty entries usable. */
+	UNIWILL_FAN_TABLE_LEGACY,
+	/* RamFan1.5: 0x0F5D-0x0F5F are status/control, not duty entries. */
+	UNIWILL_FAN_TABLE_RAMFAN1P5,
+	/* Extended RamFan2-style table where 0x0F50 starts the next table. */
+	UNIWILL_FAN_TABLE_RAMFAN2,
+};
+
 struct uniwill_data {
 	struct device *dev;
 	acpi_handle handle;
@@ -530,7 +546,7 @@ struct uniwill_data {
 	struct device *pprof_dev;	/* platform_profile class device */
 	bool custom_profile_mode_needed;
 	bool has_universal_fan_ctrl;
-	bool has_ramfan2;		/* RamFan2: F2/F3 extended fan tables present */
+	enum uniwill_fan_table_format fan_table_format;
 	bool has_double_pl4;
 	unsigned int tdp_max[3];
 	/* Per-profile default PL values read from EC firmware registers */
@@ -583,6 +599,7 @@ struct uniwill_device_descriptor {
 	unsigned int num_profiles;
 	bool custom_profile_mode_needed;
 	bool has_hidden_bios_options;
+	enum uniwill_fan_table_format fan_table_format;
 	/* Executed during driver probing */
 	int (*probe)(struct uniwill_data *data);
 };
@@ -817,6 +834,8 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	switch (reg) {
 	case EC_ADDR_CPU_TEMP:
 	case EC_ADDR_GPU_TEMP:
+	case EC_ADDR_BAT_STATUS_1:
+	case EC_ADDR_BAT_STATUS_2:
 	case EC_ADDR_EC_VERSION:
 	case EC_ADDR_EC_SUB_VERSION:
 	case EC_ADDR_SILENT_MODE_STATUS:
@@ -914,6 +933,8 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	switch (reg) {
 	case EC_ADDR_CPU_TEMP:
 	case EC_ADDR_GPU_TEMP:
+	case EC_ADDR_BAT_STATUS_1:
+	case EC_ADDR_BAT_STATUS_2:
 	case EC_ADDR_EC_VERSION:
 	case EC_ADDR_EC_SUB_VERSION:
 	case EC_ADDR_SILENT_MODE_STATUS:
@@ -942,6 +963,7 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	/* The EC may clear custom fan gates on profile/power changes. */
 	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
+	case EC_ADDR_RAMFAN1P5_TABLE_STATUS1:
 	case EC_ADDR_COOLING_MODE:
 	case EC_ADDR_CHARGE_CTRL:
 	case EC_ADDR_CHARGE_CTRL_START:
@@ -3316,9 +3338,18 @@ static int uniwill_read(struct device *dev, enum hwmon_sensor_types type, u32 at
 					       sizeof(rpm));
 			break;
 		case 1:
-			ret = regmap_bulk_read(data->regmap, EC_ADDR_SECOND_FAN_RPM_1, &rpm,
-					       sizeof(rpm));
-			break;
+			ret = regmap_read(data->regmap, EC_ADDR_SECOND_FAN_RPM_1,
+					  &value_hi);
+			if (ret < 0)
+				return ret;
+
+			ret = regmap_read(data->regmap, EC_ADDR_SECOND_FAN_RPM_2,
+					  &value);
+			if (ret < 0)
+				return ret;
+
+			*val = (value_hi << 8) | value;
+			return 0;
 		case 2:
 		case 3:
 			mutex_lock(&data->wc.lock);
@@ -3514,8 +3545,32 @@ static const struct fan_curve_zone default_gpu_curve[FAN_TABLE_ZONES] = {
 	{100, 97, 200 },	/* 100% */
 };
 
+static unsigned int uniwill_fan_gpu_duty_zones(struct uniwill_data *data)
+{
+	switch (data->fan_table_format) {
+	case UNIWILL_FAN_TABLE_RAMFAN1P5:
+		return RAMFAN1P5_GPU_DUTY_ZONES;
+	case UNIWILL_FAN_TABLE_RAMFAN2:
+		return 0;
+	default:
+		return FAN_TABLE_ZONES;
+	}
+}
+
+static bool uniwill_custom_auto_supported(struct uniwill_data *data)
+{
+	if (!data->has_universal_fan_ctrl)
+		return false;
+
+	if (data->fan_table_format == UNIWILL_FAN_TABLE_RAMFAN1P5)
+		return false;
+
+	return true;
+}
+
 static int uniwill_fan_init_tables(struct uniwill_data *data)
 {
+	unsigned int gpu_duty_zones = uniwill_fan_gpu_duty_zones(data);
 	int i, ret;
 
 	/*
@@ -3555,8 +3610,7 @@ static int uniwill_fan_init_tables(struct uniwill_data *data)
 		if (ret < 0)
 			return ret;
 
-			/* On RamFan2, 0x0F50 is F2 CPU Temp Up, not GPU Duty. */
-		if (!data->has_ramfan2) {
+		if (i < gpu_duty_zones) {
 			ret = regmap_write(data->regmap,
 					   EC_ADDR_GPU_FAN_SPEED_TABLE + i,
 					   default_gpu_curve[i].duty);
@@ -3568,11 +3622,12 @@ static int uniwill_fan_init_tables(struct uniwill_data *data)
 	return 0;
 }
 
-static int uniwill_fan_sync_table(struct uniwill_data *data, unsigned int base)
+static int uniwill_fan_sync_table(struct uniwill_data *data, unsigned int base,
+				  unsigned int length)
 {
 	int i, ret;
 
-	for (i = 0; i < FAN_TABLE_ZONES; i++) {
+	for (i = 0; i < length; i++) {
 		ret = regcache_sync_region(data->regmap, base + i, base + i);
 		if (ret < 0)
 			return ret;
@@ -3589,40 +3644,29 @@ static int uniwill_fan_sync_custom_tables(struct uniwill_data *data)
 		EC_ADDR_CPU_FAN_SPEED_TABLE,
 		EC_ADDR_GPU_TEMP_END_TABLE,
 		EC_ADDR_GPU_TEMP_START_TABLE,
-		EC_ADDR_GPU_FAN_SPEED_TABLE,
 	};
+	unsigned int gpu_duty_zones = uniwill_fan_gpu_duty_zones(data);
 	int i, ret;
 
 	for (i = 0; i < ARRAY_SIZE(bases); i++) {
-		if (data->has_ramfan2 && bases[i] == EC_ADDR_GPU_FAN_SPEED_TABLE)
-			continue;
-
-		ret = uniwill_fan_sync_table(data, bases[i]);
+		ret = uniwill_fan_sync_table(data, bases[i], FAN_TABLE_ZONES);
 		if (ret < 0)
 			return ret;
 	}
 
-	return 0;
+	if (gpu_duty_zones == 0)
+		return 0;
+
+	return uniwill_fan_sync_table(data, EC_ADDR_GPU_FAN_SPEED_TABLE,
+				      gpu_duty_zones);
 }
 
 static int uniwill_fan_enable_custom_tables(struct uniwill_data *data)
 {
 	int ret;
 
-	if (data->has_ramfan2) {
-		ret = regmap_update_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
-					 RAMFAN2_FAN_CURVE_CONTROL,
-					 RAMFAN2_FAN_CURVE_CONTROL);
-		if (ret < 0)
-			return ret;
-
-		/* OEM fan-curve parameter. Preserve unrelated bits. */
-		ret = regmap_set_bits(data->regmap, EC_ADDR_COOLING_MODE,
-				      COOLING_MODE_FAN_CURVE_INIT);
-	} else {
-		ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
-				      SPLIT_TABLES);
-	}
+	ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
+			      SPLIT_TABLES);
 	if (ret < 0)
 		return ret;
 
@@ -3640,16 +3684,6 @@ static int uniwill_fan_disable_custom_tables(struct uniwill_data *data)
 				ENABLE_UNIVERSAL_FAN_CTRL);
 	if (ret < 0)
 		return ret;
-
-	if (data->has_ramfan2) {
-		ret = regmap_clear_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
-					RAMFAN2_FAN_CURVE_CONTROL);
-		if (ret < 0)
-			return ret;
-
-		return regmap_clear_bits(data->regmap, EC_ADDR_COOLING_MODE,
-					 COOLING_MODE_FAN_CURVE_INIT);
-	}
 
 	return regmap_clear_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL,
 				 SPLIT_TABLES);
@@ -3710,7 +3744,7 @@ static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
 		data->fan_mode = 2;
 		return 0;
 	case 3:	/* Custom auto (user-defined curves in 0x0F00-0x0F5F) */
-		if (!data->has_universal_fan_ctrl)
+		if (!uniwill_custom_auto_supported(data))
 			return -EOPNOTSUPP;
 
 		ret = regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
@@ -3731,10 +3765,33 @@ static int uniwill_set_fan_mode(struct uniwill_data *data, long mode)
 	}
 }
 
+static int uniwill_apply_manual_pwm(struct uniwill_data *data, bool repeat)
+{
+	int count = repeat ? 10 : 1;
+	int i, ret;
+
+	for (i = 0; i < count; i++) {
+		ret = uniwill_wmi_ec_write(EC_ADDR_PWM_1_WRITEABLE,
+					   data->last_fan_pwm[0]);
+		if (ret < 0)
+			return ret;
+
+		ret = uniwill_wmi_ec_write(EC_ADDR_PWM_2_WRITEABLE,
+					   data->last_fan_pwm[1]);
+		if (ret < 0)
+			return ret;
+
+		if (repeat)
+			msleep(10);
+	}
+
+	return 0;
+}
+
 static int uniwill_set_pwm(struct uniwill_data *data, int channel, long val)
 {
 	unsigned int ec_val, fan_min;
-	int ret, i;
+	int ret;
 
 	if (data->fan_mode != 1)
 		return -EBUSY;
@@ -3771,13 +3828,9 @@ static int uniwill_set_pwm(struct uniwill_data *data, int channel, long val)
 		if (ret < 0)
 			return ret;
 
-		for (i = 0; i < 10; i++) {
-			uniwill_wmi_ec_write(EC_ADDR_PWM_1_WRITEABLE,
-					     data->last_fan_pwm[0]);
-			uniwill_wmi_ec_write(EC_ADDR_PWM_2_WRITEABLE,
-					     data->last_fan_pwm[1]);
-			msleep(10);
-		}
+		ret = uniwill_apply_manual_pwm(data, true);
+		if (ret < 0)
+			return ret;
 
 		data->boost_active = true;
 		return 0;
@@ -3875,6 +3928,26 @@ static const unsigned int fan_temp_start_table_base[2] = {
 	EC_ADDR_GPU_TEMP_START_TABLE,
 };
 
+static bool uniwill_auto_point_is_valid(struct uniwill_data *data,
+					unsigned int channel, unsigned int index)
+{
+	if (!uniwill_custom_auto_supported(data))
+		return false;
+
+	if (index >= FAN_TABLE_LENGTH)
+		return false;
+
+	switch (channel) {
+	case 0:
+		return uniwill_device_supports(data, UNIWILL_FEATURE_PRIMARY_FAN);
+	case 1:
+		return index < uniwill_fan_gpu_duty_zones(data) &&
+		       uniwill_device_supports(data, UNIWILL_FEATURE_SECONDARY_FAN);
+	default:
+		return false;
+	}
+}
+
 /*
  * Fan curve auto_point attributes.
  *
@@ -3898,6 +3971,9 @@ static ssize_t uniwill_auto_point_pwm_show(struct device *dev,
 	unsigned int val;
 	int ret;
 
+	if (!uniwill_auto_point_is_valid(data, attr->nr, attr->index))
+		return -EOPNOTSUPP;
+
 	ret = regmap_read(data->regmap,
 			  fan_speed_table_base[attr->nr] + attr->index,
 			  &val);
@@ -3916,6 +3992,9 @@ static ssize_t uniwill_auto_point_pwm_store(struct device *dev,
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned long val;
 	int ret;
+
+	if (!uniwill_auto_point_is_valid(data, attr->nr, attr->index))
+		return -EOPNOTSUPP;
 
 	ret = kstrtoul(buf, 10, &val);
 	if (ret < 0)
@@ -3942,6 +4021,9 @@ static ssize_t uniwill_auto_point_temp_show(struct device *dev,
 	unsigned int val;
 	int ret;
 
+	if (!uniwill_auto_point_is_valid(data, attr->nr, attr->index))
+		return -EOPNOTSUPP;
+
 	ret = regmap_read(data->regmap,
 			  fan_temp_end_table_base[attr->nr] + attr->index,
 			  &val);
@@ -3959,6 +4041,9 @@ static ssize_t uniwill_auto_point_temp_store(struct device *dev,
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned long val;
 	int ret;
+
+	if (!uniwill_auto_point_is_valid(data, attr->nr, attr->index))
+		return -EOPNOTSUPP;
 
 	ret = kstrtoul(buf, 10, &val);
 	if (ret < 0)
@@ -3986,6 +4071,9 @@ static ssize_t uniwill_auto_point_temp_hyst_show(struct device *dev,
 	unsigned int val;
 	int ret;
 
+	if (!uniwill_auto_point_is_valid(data, attr->nr, attr->index))
+		return -EOPNOTSUPP;
+
 	ret = regmap_read(data->regmap,
 			  fan_temp_start_table_base[attr->nr] + attr->index,
 			  &val);
@@ -4003,6 +4091,9 @@ static ssize_t uniwill_auto_point_temp_hyst_store(struct device *dev,
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned long val;
 	int ret;
+
+	if (!uniwill_auto_point_is_valid(data, attr->nr, attr->index))
+		return -EOPNOTSUPP;
 
 	ret = kstrtoul(buf, 10, &val);
 	if (ret < 0)
@@ -4118,7 +4209,7 @@ static umode_t uniwill_auto_point_is_visible(struct kobject *kobj,
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	const struct sensor_device_attribute_2 *sda =
 		container_of(attr, struct sensor_device_attribute_2, dev_attr.attr);
-	if (!data->has_universal_fan_ctrl)
+	if (!uniwill_custom_auto_supported(data))
 		return 0;
 
 	switch (sda->nr) {
@@ -4128,8 +4219,7 @@ static umode_t uniwill_auto_point_is_visible(struct kobject *kobj,
 			return attr->mode;
 		return 0;
 	case 1:
-		/* Hide F1 GPU on RamFan2. 0x0F50 is F2 CPU Temp Up there. */
-		if (!data->has_ramfan2 &&
+		if (sda->index < uniwill_fan_gpu_duty_zones(data) &&
 		    uniwill_device_supports(data, UNIWILL_FEATURE_SECONDARY_FAN))
 			return attr->mode;
 		return 0;
@@ -4270,18 +4360,32 @@ static bool uniwill_has_universal_fan_ctrl(struct uniwill_data *data)
 	return !!(value & UNIVERSAL_FAN_CTRL);
 }
 
-/* RamFan2 returns a valid byte here. Older tables read 0xff. */
-static bool uniwill_has_ramfan2(struct uniwill_data *data)
+static enum uniwill_fan_table_format uniwill_detect_fan_table_format(struct uniwill_data *data)
 {
 	unsigned int val;
 
 	if (!data->has_universal_fan_ctrl)
-		return false;
+		return UNIWILL_FAN_TABLE_LEGACY;
 
-	if (regmap_read(data->regmap, EC_ADDR_RAMFAN1P5_TABLE_STATUS, &val) < 0)
-		return false;
+	if (device_descriptor.fan_table_format != UNIWILL_FAN_TABLE_AUTO)
+		return device_descriptor.fan_table_format;
 
-	return val != 0xFF;
+	if (regmap_read(data->regmap, EC_ADDR_RAMFAN1P5_TABLE_STATUS1, &val) < 0)
+		return UNIWILL_FAN_TABLE_LEGACY;
+
+	if (val == 0xFF)
+		return UNIWILL_FAN_TABLE_LEGACY;
+
+	/*
+	 * 0x0F5D is RamFan1.5 status, but it is also table data on RamFan2.
+	 * Without a descriptor-level match, keep the old conservative behavior
+	 * and avoid writing 0x0F50+ as GPU duty data on unknown machines.
+	 */
+	dev_warn_once(data->dev,
+		      "ambiguous fan table status 0x0f5d=0x%02x; assuming RamFan2-compatible layout\n",
+		      val);
+
+	return UNIWILL_FAN_TABLE_RAMFAN2;
 }
 
 /*
@@ -5605,8 +5709,12 @@ static int uniwill_probe(struct platform_device *pdev)
 
 	/* Auto-detect universal fan control support */
 	data->has_universal_fan_ctrl = uniwill_has_universal_fan_ctrl(data);
-	data->has_ramfan2 = uniwill_has_ramfan2(data);
+	data->fan_table_format = uniwill_detect_fan_table_format(data);
 	data->fan_mode = 2;
+
+	if (data->fan_table_format == UNIWILL_FAN_TABLE_RAMFAN1P5)
+		dev_info(data->dev,
+			 "RamFan1.5 custom auto fan tables are unsupported; using EC automatic/manual fan modes only\n");
 
 	/* Initialise water cooler tunnel state */
 	if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER)) {
@@ -5622,7 +5730,7 @@ static int uniwill_probe(struct platform_device *pdev)
 	 * without prior auto_point programming. The EC ignores these
 	 * registers until ENABLE_UNIVERSAL_FAN_CTRL is explicitly set.
 	 */
-	if (data->has_universal_fan_ctrl) {
+	if (uniwill_custom_auto_supported(data)) {
 		ret = uniwill_fan_init_tables(data);
 		if (ret < 0)
 			return ret;
@@ -5807,11 +5915,16 @@ static int uniwill_suspend_custom_profile(struct uniwill_data *data)
 
 static int uniwill_suspend_fan_mode(struct uniwill_data *data)
 {
+	int ret;
+
 	switch (data->fan_mode) {
 	case 0:	/* Full speed - clear boost before suspend */
-		return regmap_clear_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-					 FAN_MODE_BOOST);
-	case 1:	/* Manual - disable custom tables before suspend */
+	case 1:	/* Manual - clear boost before suspend */
+		ret = regmap_clear_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+					FAN_MODE_BOOST);
+		if (ret == 0)
+			data->boost_active = false;
+		return ret;
 	case 3:	/* Custom auto - disable custom tables before suspend */
 		return uniwill_fan_disable_custom_tables(data);
 	default:
@@ -6004,27 +6117,25 @@ static int uniwill_resume_fan_mode(struct uniwill_data *data)
 
 	switch (data->fan_mode) {
 	case 0:	/* Full speed - restore boost */
-		return regmap_set_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-				       FAN_MODE_BOOST);
-	case 1:	/* Manual - re-write speed tables and re-enable custom tables */
-		/*
-		 * The fan speed table registers are volatile and lost during
-		 * sleep. Re-write the last user-set speeds for zone 0 before
-		 * re-enabling the custom table control bits.
-		 */
-		ret = regmap_write(data->regmap, EC_ADDR_CPU_FAN_SPEED_TABLE,
-				   data->last_fan_pwm[0]);
+		ret = regmap_set_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+				      FAN_MODE_BOOST);
 		if (ret < 0)
 			return ret;
 
-		if (!data->has_ramfan2) {
-			ret = regmap_write(data->regmap, EC_ADDR_GPU_FAN_SPEED_TABLE,
-					   data->last_fan_pwm[1]);
-			if (ret < 0)
-				return ret;
-		}
+		data->boost_active = true;
+		return 0;
+	case 1:	/* Manual - restore direct WMI PWM control */
+		ret = regmap_set_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+				      FAN_MODE_BOOST);
+		if (ret < 0)
+			return ret;
 
-		return uniwill_fan_enable_custom_tables(data);
+		ret = uniwill_apply_manual_pwm(data, true);
+		if (ret < 0)
+			return ret;
+
+		data->boost_active = true;
+		return 0;
 	case 3:	/* Custom auto - restore full fan curve and re-enable */
 		ret = uniwill_fan_sync_custom_tables(data);
 		if (ret < 0)
@@ -6362,6 +6473,7 @@ static struct uniwill_device_descriptor x6fr5xxy_descriptor __initdata = {
 		    UNIWILL_FEATURE_TCC_OFFSET,
 	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
+	.fan_table_format = UNIWILL_FAN_TABLE_RAMFAN1P5,
 };
 
 /* TUXEDO InfinityBook Max 15 Gen10 AMD (X5KK45xS_X5SP45xS) */
