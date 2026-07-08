@@ -554,7 +554,7 @@ struct uniwill_data {
 	unsigned int tdp_defaults_dc[3];	/* [pl_idx], used when on battery */
 	unsigned int tau_default_dc;		/* Duration/D-state default for battery saver */
 	bool has_battery_saver_defaults;
-	bool overboost_active;		/* True when performance profile is active (water cooler) */
+	bool overboost_active;		/* True when water-cooler overboost is active */
 	unsigned int vrm_saved;		/* VRM current limit before overboost */
 	unsigned int fan_mode;		/* 0=full-speed, 1=manual, 2=auto */
 	unsigned int last_fan_pwm[2];	/* Saved PWM values per fan for suspend/resume */
@@ -1396,21 +1396,44 @@ static int uniwill_nvidia_ctgp_init(struct uniwill_data *data)
 	return 0;
 }
 
+static int uniwill_performance_profile_active(struct uniwill_data *data)
+{
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &value);
+	if (ret < 0)
+		return ret;
+
+	return (value & PROFILE_MODE_MASK) == PROFILE_PERFORMANCE;
+}
+
+static int uniwill_current_pl_max(struct uniwill_data *data,
+				  unsigned int pl_idx, unsigned int *value);
+
 static ssize_t pl1_store(struct device *dev, struct device_attribute *attr,
 			 const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
+	unsigned int max;
 	int ret;
 
-	if (!data->overboost_active)
+	ret = uniwill_performance_profile_active(data);
+	if (ret < 0)
+		return ret;
+	if (!ret)
 		return -EACCES;
 
 	ret = kstrtouint(buf, 0, &value);
 	if (ret < 0)
 		return ret;
 
-	if (value < TDP_MIN_WATTS || value > data->tdp_max[0])
+	ret = uniwill_current_pl_max(data, 0, &max);
+	if (ret < 0)
+		return ret;
+
+	if (value < TDP_MIN_WATTS || value > max)
 		return -EINVAL;
 
 	ret = regmap_write(data->regmap, EC_ADDR_PL1_SETTING, value);
@@ -1440,8 +1463,14 @@ static ssize_t pl1_max_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
 
-	return sysfs_emit(buf, "%u\n", data->tdp_max[0]);
+	ret = uniwill_current_pl_max(data, 0, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", value);
 }
 
 static DEVICE_ATTR_RO(pl1_max);
@@ -1451,16 +1480,24 @@ static ssize_t pl2_store(struct device *dev, struct device_attribute *attr,
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
+	unsigned int max;
 	int ret;
 
-	if (!data->overboost_active)
+	ret = uniwill_performance_profile_active(data);
+	if (ret < 0)
+		return ret;
+	if (!ret)
 		return -EACCES;
 
 	ret = kstrtouint(buf, 0, &value);
 	if (ret < 0)
 		return ret;
 
-	if (value < TDP_MIN_WATTS || value > data->tdp_max[1])
+	ret = uniwill_current_pl_max(data, 1, &max);
+	if (ret < 0)
+		return ret;
+
+	if (value < TDP_MIN_WATTS || value > max)
 		return -EINVAL;
 
 	ret = regmap_write(data->regmap, EC_ADDR_PL2_SETTING, value);
@@ -1490,8 +1527,14 @@ static ssize_t pl2_max_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
 
-	return sysfs_emit(buf, "%u\n", data->tdp_max[1]);
+	ret = uniwill_current_pl_max(data, 1, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", value);
 }
 
 static DEVICE_ATTR_RO(pl2_max);
@@ -1501,17 +1544,25 @@ static ssize_t pl4_store(struct device *dev, struct device_attribute *attr,
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
+	unsigned int max;
 	u8 ec_value;
 	int ret;
 
-	if (!data->overboost_active)
+	ret = uniwill_performance_profile_active(data);
+	if (ret < 0)
+		return ret;
+	if (!ret)
 		return -EACCES;
 
 	ret = kstrtouint(buf, 0, &value);
 	if (ret < 0)
 		return ret;
 
-	if (value < TDP_MIN_WATTS || value > data->tdp_max[2])
+	ret = uniwill_current_pl_max(data, 2, &max);
+	if (ret < 0)
+		return ret;
+
+	if (value < TDP_MIN_WATTS || value > max)
 		return -EINVAL;
 
 	/*
@@ -1553,8 +1604,14 @@ static ssize_t pl4_max_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
 
-	return sysfs_emit(buf, "%u\n", data->tdp_max[2]);
+	ret = uniwill_current_pl_max(data, 2, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", value);
 }
 
 static DEVICE_ATTR_RO(pl4_max);
@@ -4544,6 +4601,44 @@ static bool uniwill_is_on_battery(struct uniwill_data *data)
 	return !!(value & BAT_DISCHARGING);
 }
 
+static int uniwill_current_pl_max(struct uniwill_data *data,
+				  unsigned int pl_idx, unsigned int *value)
+{
+	unsigned int profile;
+	int ret;
+
+	if (pl_idx >= 3)
+		return -EINVAL;
+
+	ret = regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &profile);
+	if (ret < 0)
+		return ret;
+
+	switch (profile & PROFILE_MODE_MASK) {
+	case PROFILE_QUIET:
+		if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
+			*value = data->tdp_defaults_dc[pl_idx];
+		else
+			*value = data->tdp_defaults[0][pl_idx];
+		return 0;
+	case PROFILE_PERFORMANCE:
+		if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
+			*value = data->tdp_defaults_dc[pl_idx];
+		else if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
+			 data->wc.enable)
+			*value = data->tdp_defaults[3][pl_idx];
+		else
+			*value = data->tdp_defaults[2][pl_idx];
+		return 0;
+	default:
+		if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
+			*value = data->tdp_defaults_dc[pl_idx];
+		else
+			*value = data->tdp_defaults[1][pl_idx];
+		return 0;
+	}
+}
+
 static int uniwill_write_pl_values(struct uniwill_data *data, int profile_idx)
 {
 	const unsigned int *pl_values = data->tdp_defaults[profile_idx];
@@ -4582,6 +4677,7 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
 	int profile_idx;
+	bool want_overboost = false;
 	int ret;
 
 	switch (profile) {
@@ -4601,17 +4697,19 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		 * Without the cooler, use the conservative air-cooled TDP.
 		 */
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
-		    data->wc.enable)
+		    data->wc.enable) {
 			profile_idx = 3;
-		else
+			want_overboost = true;
+		} else {
 			profile_idx = 2;
+		}
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
 
-	/* Disable overboost when leaving performance profile */
-	if (data->overboost_active && profile != PLATFORM_PROFILE_PERFORMANCE) {
+	/* Keep water-cooler overboost in sync with the selected PL table. */
+	if (data->overboost_active && !want_overboost) {
 		ret = uniwill_set_overboost(data, false);
 		if (ret < 0)
 			return ret;
@@ -4666,10 +4764,7 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		}
 	}
 
-	/* Enable overboost in performance mode when water cooler is active */
-	if (profile == PLATFORM_PROFILE_PERFORMANCE && !data->overboost_active &&
-	    uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
-	    data->wc.enable) {
+	if (want_overboost && !data->overboost_active) {
 		ret = uniwill_set_overboost(data, true);
 		if (ret < 0)
 			return ret;

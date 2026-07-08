@@ -82,11 +82,12 @@ KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Allows userspace applications to set the CPU PL1 (long duration power limit) in
-		watts. The acceptable range is device specific and is capped at the device-specific maximum reported by pl1_max.
+		watts. The acceptable range is capped by the current-profile maximum
+		reported by pl1_max.
 
 		Reading this file returns the current PL1 value in watts.
 
-		Writes are only permitted when the performance (overboost) profile is active.
+		Writes are only permitted when the performance platform profile is active.
 		Attempting to write in other profiles returns -EACCES.
 
 What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl1_max
@@ -94,7 +95,9 @@ Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
-		Returns the maximum allowed CPU PL1 value in watts for this device.
+		Returns the maximum CPU PL1 value in watts for the current platform
+		profile. This value changes when the platform profile, power source, or
+		water-cooler state changes.
 
 What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl2
 Date:		April 2026
@@ -102,11 +105,12 @@ KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Allows userspace applications to set the CPU PL2 (short duration power limit) in
-		watts. The acceptable range is device specific and is capped at the device-specific maximum reported by pl2_max.
+		watts. The acceptable range is capped by the current-profile maximum
+		reported by pl2_max.
 
 		Reading this file returns the current PL2 value in watts.
 
-		Writes are only permitted when the performance (overboost) profile is active.
+		Writes are only permitted when the performance platform profile is active.
 		Attempting to write in other profiles returns -EACCES.
 
 What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl2_max
@@ -114,7 +118,9 @@ Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
-		Returns the maximum allowed CPU PL2 value in watts for this device.
+		Returns the maximum CPU PL2 value in watts for the current platform
+		profile. This value changes when the platform profile, power source, or
+		water-cooler state changes.
 
 What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl4
 Date:		April 2026
@@ -122,12 +128,13 @@ KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Allows userspace applications to set the CPU PL4 (peak power limit) in watts. The
-		acceptable range is device specific and is capped at the device-specific maximum reported by pl4_max. On devices with "double PL4" support, the EC stores half the actual
+		acceptable range is capped by the current-profile maximum reported by
+		pl4_max. On devices with "double PL4" support, the EC stores half the actual
 		value internally but the sysfs interface always operates in effective watts.
 
 		Reading this file returns the current PL4 value in watts.
 
-		Writes are only permitted when the performance (overboost) profile is active.
+		Writes are only permitted when the performance platform profile is active.
 		Attempting to write in other profiles returns -EACCES.
 
 What:		/sys/bus/platform/devices/INOU0000:XX/cpu/pl4_max
@@ -135,7 +142,9 @@ Date:		April 2026
 KernelVersion:	7.3
 Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
-		Returns the maximum allowed CPU PL4 value in watts for this device.
+		Returns the maximum CPU PL4 value in watts for the current platform
+		profile. This value changes when the platform profile, power source, or
+		water-cooler state changes.
 
 What:		/sys/bus/platform/devices/INOU0000:XX/usb_c_power_priority
 Date:		February 2026
