@@ -401,8 +401,8 @@ Contact:	Erhan Bilgili <nano.matters.code@gmail.com>
 Description:
 		Enables or disables liquid cooling mode. Writing "1" activates liquid cooling by
 		setting the EC cooling mode register. Writing "0" deactivates it. Toggling this
-		attribute also re-applies the current platform profile to adjust power limits and
-		overboost settings for the new cooling state.
+		attribute also re-applies the current platform profile to adjust power limits for
+		the new cooling state.
 
 		Reading this file returns the current liquid cooling enable status.
 

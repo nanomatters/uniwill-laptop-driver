@@ -11,9 +11,6 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-/* Uncomment to enable VRM current limit override in overboost mode */
-/* #define UNIWILL_ENABLE_VRM_OVERRIDE */
-
 #include <linux/acpi.h>
 #include <linux/array_size.h>
 #include <linux/bits.h>
@@ -539,6 +536,7 @@ struct uniwill_data {
 	struct mutex input_lock;	/* Protects input sequence during notify */
 	struct input_dev *input_device;
 	struct notifier_block nb;
+	struct mutex power_lock;		/* Protects profile and cooling power state */
 	struct mutex usb_c_power_priority_lock; /* Protects dependent bit write and state safe */
 	enum usb_c_power_priority_options last_usb_c_power_priority_option;
 	unsigned int num_profiles;
@@ -551,11 +549,11 @@ struct uniwill_data {
 	unsigned int tdp_max[3];
 	/* Per-profile default PL values read from EC firmware registers */
 	unsigned int tdp_defaults[4][3];	/* [profile_idx][pl_idx] */
+	bool tdp_defaults_valid[4];
 	unsigned int tdp_defaults_dc[3];	/* [pl_idx], used when on battery */
 	unsigned int tau_default_dc;		/* Duration/D-state default for battery saver */
 	bool has_battery_saver_defaults;
-	bool overboost_active;		/* True when water-cooler overboost is active */
-	unsigned int vrm_saved;		/* VRM current limit before overboost */
+	bool oem_high_power_active;	/* State of the OEM high-power flag */
 	unsigned int fan_mode;		/* 0=full-speed, 1=manual, 2=auto */
 	unsigned int last_fan_pwm[2];	/* Saved PWM values per fan for suspend/resume */
 	bool boost_active;		/* True when EC is in boost (FAN_MODE_BOOST) mode */
@@ -598,6 +596,7 @@ struct uniwill_device_descriptor {
 	unsigned int lightbar_max_brightness;
 	unsigned int num_profiles;
 	bool custom_profile_mode_needed;
+	unsigned int tdp_max[3];
 	bool has_hidden_bios_options;
 	enum uniwill_fan_table_format fan_table_format;
 	/* Executed during driver probing */
@@ -1270,10 +1269,10 @@ static ssize_t ctgp_offset_store(struct device *dev, struct device_attribute *at
 	if (ret < 0)
 		return ret;
 
-	if (value > U8_MAX)
-		return -EINVAL;
+	if (!data->ctgp_max)
+		return -EOPNOTSUPP;
 
-	if (data->ctgp_max && value > data->ctgp_max)
+	if (value > data->ctgp_max)
 		return -EINVAL;
 
 	ret = regmap_write(data->regmap, EC_ADDR_CTGP_DB_CTGP_OFFSET, value);
@@ -1415,6 +1414,63 @@ static int uniwill_current_pl_max_for_profile(struct uniwill_data *data,
 					      unsigned int profile,
 					      unsigned int pl_idx,
 					      unsigned int *value);
+static int uniwill_set_oem_high_power(struct uniwill_data *data, bool enable);
+
+static int uniwill_enable_custom_profile_mode(struct uniwill_data *data)
+{
+	if (!data->custom_profile_mode_needed)
+		return 0;
+
+	return regmap_set_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
+			       CUSTOM_PROFILE_MODE);
+}
+
+static bool uniwill_profile_wants_oem_high_power(struct uniwill_data *data,
+						 unsigned int profile)
+{
+	return uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
+	       profile == PROFILE_PERFORMANCE;
+}
+
+static unsigned int uniwill_tdp_profile_index(struct uniwill_data *data,
+					      unsigned int profile)
+{
+	switch (profile) {
+	case PROFILE_QUIET:
+		return 0;
+	case PROFILE_PERFORMANCE:
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
+		    data->wc.enable)
+			return 3;
+		return 2;
+	default:
+		return 1;
+	}
+}
+
+static int uniwill_sync_manual_pl_state(struct uniwill_data *data,
+					unsigned int profile)
+{
+	bool want_high_power;
+	int ret;
+
+	if (profile != PROFILE_PERFORMANCE)
+		return -EACCES;
+
+	ret = uniwill_enable_custom_profile_mode(data);
+	if (ret < 0)
+		return ret;
+
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
+		return 0;
+
+	want_high_power = uniwill_profile_wants_oem_high_power(data, profile);
+
+	if (data->oem_high_power_active != want_high_power)
+		return uniwill_set_oem_high_power(data, want_high_power);
+
+	return 0;
+}
 
 static ssize_t pl1_store(struct device *dev, struct device_attribute *attr,
 			 const char *buf, size_t count)
@@ -1424,6 +1480,8 @@ static ssize_t pl1_store(struct device *dev, struct device_attribute *attr,
 	unsigned int value;
 	unsigned int max;
 	int ret;
+
+	guard(mutex)(&data->power_lock);
 
 	ret = uniwill_read_profile_mode(data, &profile);
 	if (ret < 0)
@@ -1441,6 +1499,10 @@ static ssize_t pl1_store(struct device *dev, struct device_attribute *attr,
 
 	if (value < TDP_MIN_WATTS || value > max)
 		return -EINVAL;
+
+	ret = uniwill_sync_manual_pl_state(data, profile);
+	if (ret < 0)
+		return ret;
 
 	ret = regmap_write(data->regmap, EC_ADDR_PL1_SETTING, value);
 	if (ret < 0)
@@ -1472,6 +1534,8 @@ static ssize_t pl1_max_show(struct device *dev, struct device_attribute *attr,
 	unsigned int value;
 	int ret;
 
+	guard(mutex)(&data->power_lock);
+
 	ret = uniwill_current_pl_max(data, 0, &value);
 	if (ret < 0)
 		return ret;
@@ -1490,6 +1554,8 @@ static ssize_t pl2_store(struct device *dev, struct device_attribute *attr,
 	unsigned int max;
 	int ret;
 
+	guard(mutex)(&data->power_lock);
+
 	ret = uniwill_read_profile_mode(data, &profile);
 	if (ret < 0)
 		return ret;
@@ -1506,6 +1572,10 @@ static ssize_t pl2_store(struct device *dev, struct device_attribute *attr,
 
 	if (value < TDP_MIN_WATTS || value > max)
 		return -EINVAL;
+
+	ret = uniwill_sync_manual_pl_state(data, profile);
+	if (ret < 0)
+		return ret;
 
 	ret = regmap_write(data->regmap, EC_ADDR_PL2_SETTING, value);
 	if (ret < 0)
@@ -1537,6 +1607,8 @@ static ssize_t pl2_max_show(struct device *dev, struct device_attribute *attr,
 	unsigned int value;
 	int ret;
 
+	guard(mutex)(&data->power_lock);
+
 	ret = uniwill_current_pl_max(data, 1, &value);
 	if (ret < 0)
 		return ret;
@@ -1546,6 +1618,18 @@ static ssize_t pl2_max_show(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RO(pl2_max);
 
+static unsigned int uniwill_pl4_from_ec(const struct uniwill_data *data,
+					unsigned int value)
+{
+	return data->has_double_pl4 ? value * 2 : value;
+}
+
+static unsigned int uniwill_pl4_to_ec(const struct uniwill_data *data,
+				      unsigned int value)
+{
+	return data->has_double_pl4 ? value / 2 : value;
+}
+
 static ssize_t pl4_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count)
 {
@@ -1553,8 +1637,9 @@ static ssize_t pl4_store(struct device *dev, struct device_attribute *attr,
 	unsigned int profile;
 	unsigned int value;
 	unsigned int max;
-	u8 ec_value;
 	int ret;
+
+	guard(mutex)(&data->power_lock);
 
 	ret = uniwill_read_profile_mode(data, &profile);
 	if (ret < 0)
@@ -1573,16 +1658,12 @@ static ssize_t pl4_store(struct device *dev, struct device_attribute *attr,
 	if (value < TDP_MIN_WATTS || value > max)
 		return -EINVAL;
 
-	/*
-	 * Some devices store half the PL4 value in the EC register.
-	 * The maximum effective PL4 is thus 510 W on those devices.
-	 */
-	if (data->has_double_pl4)
-		ec_value = value / 2;
-	else
-		ec_value = value;
+	ret = uniwill_sync_manual_pl_state(data, profile);
+	if (ret < 0)
+		return ret;
 
-	ret = regmap_write(data->regmap, EC_ADDR_PL4_SETTING, ec_value);
+	ret = regmap_write(data->regmap, EC_ADDR_PL4_SETTING,
+			   uniwill_pl4_to_ec(data, value));
 	if (ret < 0)
 		return ret;
 
@@ -1600,8 +1681,7 @@ static ssize_t pl4_show(struct device *dev, struct device_attribute *attr,
 	if (ret < 0)
 		return ret;
 
-	if (data->has_double_pl4)
-		value *= 2;
+	value = uniwill_pl4_from_ec(data, value);
 
 	return sysfs_emit(buf, "%u\n", value);
 }
@@ -1614,6 +1694,8 @@ static ssize_t pl4_max_show(struct device *dev, struct device_attribute *attr,
 	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
 	int ret;
+
+	guard(mutex)(&data->power_lock);
 
 	ret = uniwill_current_pl_max(data, 2, &value);
 	if (ret < 0)
@@ -1669,7 +1751,7 @@ static int uniwill_smrw_read(struct uniwill_data *data, u8 index, u8 *val)
 }
 
 /*
- * Try to override hardcoded TDP limits with dynamic values from SMRW.
+ * Try to override descriptor TDP limits with dynamic values from SMRW.
  *
  * Only overrides a limit if the returned value passes the firmware's
  * own validation rules (value in range and not 0xFF). Values outside
@@ -1703,18 +1785,15 @@ static int uniwill_smrw_read_tdp_limits(struct uniwill_data *data)
 		data->tdp_max[1] = pl2;
 
 	if (pl4 != 0xFF && pl4 >= 15 && pl4 <= 250) {
-		pl4_effective = pl4;
-		if (data->has_double_pl4)
-			pl4_effective *= 2;
-
+		pl4_effective = uniwill_pl4_from_ec(data, pl4);
 		data->tdp_max[2] = pl4_effective;
 	}
 
 	if (old_max[0] != data->tdp_max[0] ||
 	    old_max[1] != data->tdp_max[1] ||
 	    old_max[2] != data->tdp_max[2])
-		dev_warn(data->dev,
-			 "SMRW overrides hardcoded TDP max: PL1 %u->%u PL2 %u->%u PL4 %u->%u\n",
+		dev_info(data->dev,
+			 "SMRW overrides fallback TDP max: PL1 %u->%u PL2 %u->%u PL4 %u->%u\n",
 			 old_max[0], data->tdp_max[0],
 			 old_max[1], data->tdp_max[1],
 			 old_max[2], data->tdp_max[2]);
@@ -1739,15 +1818,15 @@ static void uniwill_smrw_read_gpu_limits(struct uniwill_data *data)
 	int ret;
 
 	ret = uniwill_smrw_read(data, SMRW_INDEX_CTGP_MAX, &val);
-	if (ret == 0 && val != 0xFF && val > 0)
+	if (ret == 0 && val != U8_MAX && val > 0)
 		data->ctgp_max = val;
 
 	ret = uniwill_smrw_read(data, SMRW_INDEX_DB_MAX, &val);
-	if (ret == 0 && val != 0xFF && val > 0)
+	if (ret == 0 && val >= 1 && val <= 50)
 		data->db_max = val;
 
 	ret = uniwill_smrw_read(data, SMRW_INDEX_TGP_BASE, &val);
-	if (ret == 0 && val != 0xFF && val > 0)
+	if (ret == 0 && val >= 50 && val <= 200)
 		data->tgp_base = val;
 
 	dev_info(data->dev,
@@ -1838,6 +1917,20 @@ static ssize_t fan_switch_speed_store(struct device *dev, struct device_attribut
 
 static DEVICE_ATTR_RW(fan_switch_speed);
 
+static bool uniwill_tdp_values_valid(const struct uniwill_data *data,
+				     const unsigned int values[3])
+{
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		if (!values[i] || values[i] == U8_MAX ||
+		    values[i] > data->tdp_max[i])
+			return false;
+	}
+
+	return true;
+}
+
 static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 {
 	unsigned int value;
@@ -1877,6 +1970,13 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	if (ret < 0)
 		dev_dbg(data->dev, "SMRW dynamic TDP read unavailable: %d\n", ret);
 
+	if (!data->tdp_max[0] || !data->tdp_max[1] || !data->tdp_max[2]) {
+		dev_warn(data->dev,
+			 "CPU power control disabled because complete TDP limits are unavailable\n");
+		data->features &= ~UNIWILL_FEATURE_CPU_TDP_CONTROL;
+		return 0;
+	}
+
 	/*
 	 * Read per-profile default PL values from EC firmware registers.
 	 * These are set by the firmware and define the PL1/PL2/PL4 values
@@ -1899,7 +1999,7 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	ret = regmap_read(data->regmap, EC_ADDR_PL4_DEFAULT_OFFICE, &value);
 	if (ret < 0)
 		return ret;
-	data->tdp_defaults[0][2] = value;
+	data->tdp_defaults[0][2] = uniwill_pl4_from_ec(data, value);
 
 	ret = regmap_read(data->regmap, EC_ADDR_PL1_DEFAULT_GAMING, &value);
 	if (ret < 0)
@@ -1914,21 +2014,29 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 	ret = regmap_read(data->regmap, EC_ADDR_PL4_DEFAULT_GAMING, &value);
 	if (ret < 0)
 		return ret;
-	data->tdp_defaults[1][2] = value;
+	data->tdp_defaults[1][2] = uniwill_pl4_from_ec(data, value);
+
+	data->tdp_defaults_valid[0] =
+		uniwill_tdp_values_valid(data, data->tdp_defaults[0]);
+	data->tdp_defaults_valid[1] =
+		uniwill_tdp_values_valid(data, data->tdp_defaults[1]);
+	if (!data->tdp_defaults_valid[0] || !data->tdp_defaults_valid[1]) {
+		dev_warn(data->dev,
+			 "CPU power control disabled because profile defaults are invalid\n");
+		data->features &= ~UNIWILL_FEATURE_CPU_TDP_CONTROL;
+	}
 
 	/* Performance (Turbo) mode: midpoint between balanced and max values */
 	data->tdp_defaults[2][0] = (data->tdp_defaults[1][0] + data->tdp_max[0]) / 2;
 	data->tdp_defaults[2][1] = (data->tdp_defaults[1][1] + data->tdp_max[1]) / 2;
 	data->tdp_defaults[2][2] = (data->tdp_defaults[1][2] + data->tdp_max[2]) / 2;
+	data->tdp_defaults_valid[2] = data->tdp_defaults_valid[1];
 
-	/*
-	 * Performance profile on water-cooled devices: use the SMRW-reported
-	 * maximums. These are written to the EC together with a raised VRM
-	 * current limit to unlock the full power envelope with liquid cooling.
-	 */
+	/* A connected water cooler permits the full validated limits. */
 	data->tdp_defaults[3][0] = data->tdp_max[0];
 	data->tdp_defaults[3][1] = data->tdp_max[1];
 	data->tdp_defaults[3][2] = data->tdp_max[2];
+	data->tdp_defaults_valid[3] = true;
 
 	if (regmap_read(data->regmap, EC_ADDR_PL1_DEFAULT_BATTERYSAVER, &value) == 0)
 		data->tdp_defaults_dc[0] = value;
@@ -1937,14 +2045,12 @@ static int uniwill_cpu_tdp_init(struct uniwill_data *data)
 		data->tdp_defaults_dc[1] = value;
 
 	if (regmap_read(data->regmap, EC_ADDR_PL4_DEFAULT_BATTERYSAVER, &value) == 0)
-		data->tdp_defaults_dc[2] = value;
+		data->tdp_defaults_dc[2] = uniwill_pl4_from_ec(data, value);
 
 	if (regmap_read(data->regmap, EC_ADDR_TAU_DEFAULT_BATTERYSAVER, &value) == 0)
 		data->tau_default_dc = value;
 
-	if (data->tdp_defaults_dc[0] != 0x00 && data->tdp_defaults_dc[0] != 0xFF &&
-	    data->tdp_defaults_dc[1] != 0x00 && data->tdp_defaults_dc[1] != 0xFF &&
-	    data->tdp_defaults_dc[2] != 0x00 && data->tdp_defaults_dc[2] != 0xFF) {
+	if (uniwill_tdp_values_valid(data, data->tdp_defaults_dc)) {
 		data->has_battery_saver_defaults = true;
 		dev_dbg(data->dev, "TDP defaults (DC): %u/%u/%u tau=%u\n",
 			data->tdp_defaults_dc[0], data->tdp_defaults_dc[1],
@@ -2870,8 +2976,13 @@ static umode_t uniwill_dgpu_is_visible(struct kobject *kobj, struct attribute *a
 	struct device *dev = kobj_to_dev(kobj);
 	struct uniwill_data *data = dev_get_drvdata(dev);
 
-	if (attr == &dev_attr_ctgp_offset.attr ||
-	    attr == &dev_attr_dynamic_boost_enable.attr) {
+	if (attr == &dev_attr_ctgp_offset.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL) &&
+		    data->ctgp_max)
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_dynamic_boost_enable.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_NVIDIA_CTGP_CONTROL))
 			return attr->mode;
 	}
@@ -2947,9 +3058,10 @@ static const struct attribute_group uniwill_info_group = {
 	.attrs = uniwill_info_attrs,
 };
 
-/* Forward declarations for profile functions used in enable_store */
+/* Forward declarations for profile functions used by the cooler bridge. */
 static int uniwill_profile_get(struct device *dev, enum platform_profile_option *profile);
-static int uniwill_profile_set(struct device *dev, enum platform_profile_option profile);
+static int uniwill_apply_profile(struct uniwill_data *data,
+				 enum platform_profile_option profile);
 
 /* Water cooler sysfs bridge attributes */
 
@@ -3099,45 +3211,81 @@ static ssize_t fan_mode_show(struct device *dev, struct device_attribute *attr, 
 static ssize_t enable_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
+	bool enable;
 
-	return sysfs_emit(buf, "%u\n", data->wc.enable);
+	mutex_lock(&data->wc.lock);
+	enable = data->wc.enable;
+	mutex_unlock(&data->wc.lock);
+
+	return sysfs_emit(buf, "%u\n", enable);
 }
 
 static ssize_t enable_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
+	enum platform_profile_option profile;
+	bool have_profile = false;
+	bool old_enable;
 	bool enable;
+	int rollback_ret;
 	int ret;
+	int apply_ret;
+
+	guard(mutex)(&data->power_lock);
 
 	if (kstrtobool(buf, &enable))
 		return -EINVAL;
 
 	mutex_lock(&data->wc.lock);
+	old_enable = data->wc.enable;
+	mutex_unlock(&data->wc.lock);
+
+	if (old_enable == enable)
+		return count;
 
 	ret = regmap_update_bits(data->regmap, EC_ADDR_COOLING_MODE,
 				 COOLING_MODE_LC_ACTIVE,
 				 enable ? COOLING_MODE_LC_ACTIVE : 0);
-	if (ret == 0)
-		data->wc.enable = enable;
-
-	mutex_unlock(&data->wc.lock);
-
 	if (ret < 0)
 		return ret;
 
-	/*
-	 * Re-apply the current profile so TDP values and overboost
-	 * adjust to the new cooling state immediately.
-	 */
-	if (data->pprof_dev) {
-		enum platform_profile_option cur;
+	mutex_lock(&data->wc.lock);
+	data->wc.enable = enable;
+	mutex_unlock(&data->wc.lock);
 
-		if (uniwill_profile_get(data->pprof_dev, &cur) == 0)
-			uniwill_profile_set(data->pprof_dev, cur);
+	if (!data->pprof_dev)
+		return count;
+
+	ret = uniwill_profile_get(data->pprof_dev, &profile);
+	if (ret == 0) {
+		have_profile = true;
+		ret = uniwill_apply_profile(data, profile);
+	}
+	if (ret == 0)
+		return count;
+
+	rollback_ret = regmap_update_bits(data->regmap, EC_ADDR_COOLING_MODE,
+					  COOLING_MODE_LC_ACTIVE,
+					  old_enable ? COOLING_MODE_LC_ACTIVE : 0);
+	if (rollback_ret < 0)
+		dev_warn(data->dev,
+			 "Failed to restore cooling mode after profile error: %d\n",
+			 rollback_ret);
+
+	mutex_lock(&data->wc.lock);
+	data->wc.enable = rollback_ret < 0 ? enable : old_enable;
+	mutex_unlock(&data->wc.lock);
+
+	if (have_profile) {
+		apply_ret = uniwill_apply_profile(data, profile);
+		if (apply_ret < 0)
+			dev_warn(data->dev,
+				 "Failed to synchronize profile after cooling mode error: %d\n",
+				 apply_ret);
 	}
 
-	return count;
+	return ret;
 }
 
 static DEVICE_ATTR_RW(fan_rpm);
@@ -4515,51 +4663,17 @@ static int uniwill_mini_led_init(struct uniwill_data *data)
 	return 0;
 }
 
-/*
- * Enable or disable overboost mode by setting the OVERBOOST bit in the
- * EC OEM_3 register and raising the VRM current limit to the maximum.
- * This unlocks higher CPU power envelopes (e.g. 160W sustained with
- * external liquid cooling vs 135W on air).
- */
-static int uniwill_set_overboost(struct uniwill_data *data, bool enable)
+/* Control the OEM high-power flag used with the performance profile. */
+static int uniwill_set_oem_high_power(struct uniwill_data *data, bool enable)
 {
 	int ret;
-#ifdef UNIWILL_ENABLE_VRM_OVERRIDE
-	unsigned int vrm_max;
-#endif
 
 	ret = regmap_update_bits(data->regmap, EC_ADDR_OEM_3, OVERBOOST,
 				 enable ? OVERBOOST : 0);
 	if (ret < 0)
 		return ret;
 
-#ifdef UNIWILL_ENABLE_VRM_OVERRIDE
-	if (enable) {
-		/* Save current VRM limit and raise to maximum */
-		ret = regmap_read(data->regmap, EC_ADDR_VRM_CURRENT_LIMIT,
-				  &data->vrm_saved);
-		if (ret < 0)
-			return ret;
-
-		ret = regmap_read(data->regmap, EC_ADDR_VRM_MAX_CURRENT_LIMIT,
-				  &vrm_max);
-		if (ret < 0)
-			return ret;
-
-		ret = regmap_write(data->regmap, EC_ADDR_VRM_CURRENT_LIMIT,
-				   vrm_max);
-		if (ret < 0)
-			return ret;
-	} else {
-		/* Restore previous VRM current limit */
-		ret = regmap_write(data->regmap, EC_ADDR_VRM_CURRENT_LIMIT,
-				   data->vrm_saved);
-		if (ret < 0)
-			return ret;
-	}
-#endif
-
-	data->overboost_active = enable;
+	data->oem_high_power_active = enable;
 	return 0;
 }
 
@@ -4576,6 +4690,18 @@ static int uniwill_profile_probe(void *drvdata, unsigned long *choices)
 	return 0;
 }
 
+static enum platform_profile_option uniwill_platform_profile_from_ec(unsigned int value)
+{
+	switch (value & PROFILE_MODE_MASK) {
+	case PROFILE_QUIET:
+		return PLATFORM_PROFILE_QUIET;
+	case PROFILE_PERFORMANCE:
+		return PLATFORM_PROFILE_PERFORMANCE;
+	default:
+		return PLATFORM_PROFILE_BALANCED;
+	}
+}
+
 static int uniwill_profile_get(struct device *dev, enum platform_profile_option *profile)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -4586,17 +4712,9 @@ static int uniwill_profile_get(struct device *dev, enum platform_profile_option 
 	if (ret < 0)
 		return ret;
 
-	switch (value & PROFILE_MODE_MASK) {
-	case PROFILE_QUIET:
-		*profile = PLATFORM_PROFILE_QUIET;
-		return 0;
-	case PROFILE_PERFORMANCE:
-		*profile = PLATFORM_PROFILE_PERFORMANCE;
-		return 0;
-	default:
-		*profile = PLATFORM_PROFILE_BALANCED;
-		return 0;
-	}
+	*profile = uniwill_platform_profile_from_ec(value);
+
+	return 0;
 }
 
 static bool uniwill_is_on_battery(struct uniwill_data *data)
@@ -4614,32 +4732,23 @@ static int uniwill_current_pl_max_for_profile(struct uniwill_data *data,
 					      unsigned int pl_idx,
 					      unsigned int *value)
 {
+	unsigned int profile_idx;
+
 	if (pl_idx >= 3)
 		return -EINVAL;
 
-	switch (profile) {
-	case PROFILE_QUIET:
-		if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
-			*value = data->tdp_defaults_dc[pl_idx];
-		else
-			*value = data->tdp_defaults[0][pl_idx];
-		return 0;
-	case PROFILE_PERFORMANCE:
-		if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
-			*value = data->tdp_defaults_dc[pl_idx];
-		else if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
-			 data->wc.enable)
-			*value = data->tdp_defaults[3][pl_idx];
-		else
-			*value = data->tdp_defaults[2][pl_idx];
-		return 0;
-	default:
-		if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
-			*value = data->tdp_defaults_dc[pl_idx];
-		else
-			*value = data->tdp_defaults[1][pl_idx];
+	if (data->has_battery_saver_defaults && uniwill_is_on_battery(data)) {
+		*value = data->tdp_defaults_dc[pl_idx];
 		return 0;
 	}
+
+	profile_idx = uniwill_tdp_profile_index(data, profile);
+	if (!data->tdp_defaults_valid[profile_idx])
+		return -EOPNOTSUPP;
+
+	*value = data->tdp_defaults[profile_idx][pl_idx];
+
+	return 0;
 }
 
 static int uniwill_current_pl_max(struct uniwill_data *data,
@@ -4657,15 +4766,25 @@ static int uniwill_current_pl_max(struct uniwill_data *data,
 
 static int uniwill_write_pl_values(struct uniwill_data *data, int profile_idx)
 {
-	const unsigned int *pl_values = data->tdp_defaults[profile_idx];
+	const unsigned int *pl_values;
 	unsigned int pl4_val;
 	int ret;
 
 	if (!uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL))
 		return 0;
 
-	if (data->has_battery_saver_defaults && uniwill_is_on_battery(data))
+	if (profile_idx < 0 ||
+	    profile_idx >= (int)ARRAY_SIZE(data->tdp_defaults))
+		return -EINVAL;
+
+	if (data->has_battery_saver_defaults && uniwill_is_on_battery(data)) {
 		pl_values = data->tdp_defaults_dc;
+	} else {
+		if (!data->tdp_defaults_valid[profile_idx])
+			return 0;
+
+		pl_values = data->tdp_defaults[profile_idx];
+	}
 
 	ret = regmap_write(data->regmap, EC_ADDR_PL1_SETTING,
 			   pl_values[0]);
@@ -4677,65 +4796,41 @@ static int uniwill_write_pl_values(struct uniwill_data *data, int profile_idx)
 	if (ret < 0)
 		return ret;
 
-	/*
-	 * Some devices store half the PL4 value in the EC register.
-	 * Apply the halving when writing profile defaults.
-	 */
-	pl4_val = pl_values[2];
-	if (data->has_double_pl4 && pl4_val)
-		pl4_val /= 2;
+	pl4_val = uniwill_pl4_to_ec(data, pl_values[2]);
 
 	return regmap_write(data->regmap, EC_ADDR_PL4_SETTING, pl4_val);
 }
 
-static int uniwill_profile_set(struct device *dev, enum platform_profile_option profile)
+static int uniwill_apply_profile(struct uniwill_data *data,
+				 enum platform_profile_option profile)
 {
-	struct uniwill_data *data = dev_get_drvdata(dev);
 	unsigned int value;
 	int profile_idx;
-	bool want_overboost = false;
+	bool want_high_power;
 	int ret;
 
 	switch (profile) {
 	case PLATFORM_PROFILE_QUIET:
 		value = PROFILE_QUIET;
-		profile_idx = 0;
 		break;
 	case PLATFORM_PROFILE_BALANCED:
 		value = PROFILE_BALANCED;
-		profile_idx = 1;
 		break;
 	case PLATFORM_PROFILE_PERFORMANCE:
 		value = PROFILE_PERFORMANCE;
-		/*
-		 * Water-cooled devices use maximum TDP values and overboost
-		 * only when the cooler is actively connected (wc.enable).
-		 * Without the cooler, use the conservative air-cooled TDP.
-		 */
-		if (uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER) &&
-		    data->wc.enable) {
-			profile_idx = 3;
-			want_overboost = true;
-		} else {
-			profile_idx = 2;
-		}
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
 
-	/* Keep water-cooler overboost in sync with the selected PL table. */
-	if (data->overboost_active && !want_overboost) {
-		ret = uniwill_set_overboost(data, false);
-		if (ret < 0)
-			return ret;
-	}
+	profile_idx = uniwill_tdp_profile_index(data, value);
+	want_high_power = uniwill_profile_wants_oem_high_power(data, value);
 
-	/*
-	 * Set the fan/profile mode BEFORE writing PL values. The EC firmware
-	 * may ignore PL writes unless the target profile mode is active.
-	 * The tuxedo control center follows this same order.
-	 */
+	ret = uniwill_enable_custom_profile_mode(data);
+	if (ret < 0)
+		return ret;
+
+	/* The EC may ignore PL writes until the target profile is active. */
 	ret = regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
 				 PROFILE_MODE_MASK, value);
 	if (ret < 0)
@@ -4743,6 +4838,12 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 
 	/* Track EC mode for Fn key cycling logic */
 	data->last_profile_ctrl = value;
+
+	if (data->oem_high_power_active != want_high_power) {
+		ret = uniwill_set_oem_high_power(data, want_high_power);
+		if (ret < 0)
+			return ret;
+	}
 
 	/*
 	 * Write the mode index register. The EC and/or other firmware
@@ -4780,12 +4881,6 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		}
 	}
 
-	if (want_overboost && !data->overboost_active) {
-		ret = uniwill_set_overboost(data, true);
-		if (ret < 0)
-			return ret;
-	}
-
 	if (data->fan_mode == 3) {
 		ret = uniwill_fan_sync_custom_tables(data);
 		if (ret < 0)
@@ -4797,6 +4892,16 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 	}
 
 	return 0;
+}
+
+static int uniwill_profile_set(struct device *dev,
+			       enum platform_profile_option profile)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+
+	guard(mutex)(&data->power_lock);
+
+	return uniwill_apply_profile(data, profile);
 }
 
 static const struct platform_profile_ops uniwill_profile_ops = {
@@ -4814,6 +4919,8 @@ static int uniwill_profile_cycle(struct uniwill_data *data)
 {
 	enum platform_profile_option cur, next;
 	int ret;
+
+	guard(mutex)(&data->power_lock);
 
 	ret = uniwill_profile_get(data->pprof_dev, &cur);
 	if (ret < 0)
@@ -4837,7 +4944,7 @@ static int uniwill_profile_cycle(struct uniwill_data *data)
 		break;
 	}
 
-	ret = uniwill_profile_set(data->pprof_dev, next);
+	ret = uniwill_apply_profile(data, next);
 	if (ret < 0)
 		return ret;
 
@@ -4848,19 +4955,14 @@ static int uniwill_profile_cycle(struct uniwill_data *data)
 static int uniwill_profile_init(struct uniwill_data *data)
 {
 	struct device *pprof;
+	int ret;
 
 	if (data->num_profiles == 0)
 		return 0;
 
-	/*
-	 * Initialize to balanced mode. This matches the tuxedo driver behavior
-	 * which resets EC_ADDR_MANUAL_FAN_CTRL to 0x00 during probe.
-	 * Also write the corresponding default PL values.
-	 */
-	regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-			   PROFILE_MODE_MASK, PROFILE_BALANCED);
-	data->last_profile_ctrl = PROFILE_BALANCED;
-	uniwill_write_pl_values(data, 1);
+	ret = uniwill_apply_profile(data, PLATFORM_PROFILE_BALANCED);
+	if (ret < 0)
+		return ret;
 
 	pprof = devm_platform_profile_register(data->dev, "uniwill-platform-profile",
 					       data, &uniwill_profile_ops);
@@ -4878,12 +4980,7 @@ static int uniwill_custom_profile_init(struct uniwill_data *data)
 	if (!data->custom_profile_mode_needed)
 		return 0;
 
-	/*
-	 * Some devices require EC register 0x0727 bit 6 (custom profile mode)
-	 * to be set for TDP and fan control to work properly. The bit is first
-	 * cleared and then set  after a short delay, since certain devices need
-	 * this sequence for reliable activation.
-	 */
+	/* Some devices require a clear and set sequence during probe. */
 	ret = regmap_clear_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
 				CUSTOM_PROFILE_MODE);
 	if (ret < 0)
@@ -4891,8 +4988,7 @@ static int uniwill_custom_profile_init(struct uniwill_data *data)
 
 	msleep(50);
 
-	return regmap_set_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
-			       CUSTOM_PROFILE_MODE);
+	return uniwill_enable_custom_profile_mode(data);
 }
 
 static const unsigned int uniwill_led_channel_to_bat_reg[LED_CHANNELS] = {
@@ -5591,6 +5687,7 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 {
 	struct uniwill_data *data = container_of(nb, struct uniwill_data, nb);
 	struct uniwill_battery_entry *entry;
+	int ret;
 
 	switch (action) {
 	case UNIWILL_OSD_BATTERY_ALERT:
@@ -5606,39 +5703,25 @@ static int uniwill_notifier_call(struct notifier_block *nb, unsigned long action
 
 		return NOTIFY_OK;
 	case UNIWILL_OSD_DC_ADAPTER_CHANGED:
-		/*
-		 * Re-apply custom profile mode on AC adapter change. Some
-		 * devices lose this setting when the power source changes.
-		 */
-		if (data->custom_profile_mode_needed)
-			regmap_set_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
-					CUSTOM_PROFILE_MODE);
-
-		/*
-		 * Re-apply PL values on AC/DC change. The EC may reset them
-		 * to defaults when the power source changes.
-		 */
+		/* The EC may reset profile state when the power source changes. */
 		if (data->num_profiles > 0 &&
 		    uniwill_device_supports(data, UNIWILL_FEATURE_CPU_TDP_CONTROL)) {
+			enum platform_profile_option profile;
 			unsigned int fan_ctrl;
 
-			if (regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-					&fan_ctrl) == 0) {
-				enum platform_profile_option p;
+			ret = regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
+					  &fan_ctrl);
+			if (ret < 0)
+				return notifier_from_errno(ret);
 
-				switch (fan_ctrl & PROFILE_MODE_MASK) {
-				case PROFILE_QUIET:
-					p = PLATFORM_PROFILE_QUIET;
-					break;
-				case PROFILE_PERFORMANCE:
-					p = PLATFORM_PROFILE_PERFORMANCE;
-					break;
-				default:
-					p = PLATFORM_PROFILE_BALANCED;
-					break;
-				}
-				uniwill_profile_set(data->dev, p);
-			}
+			profile = uniwill_platform_profile_from_ec(fan_ctrl);
+			ret = uniwill_profile_set(data->dev, profile);
+			if (ret < 0)
+				return notifier_from_errno(ret);
+		} else {
+			ret = uniwill_enable_custom_profile_mode(data);
+			if (ret < 0)
+				return notifier_from_errno(ret);
 		}
 
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_USB_C_POWER_PRIORITY))
@@ -5750,6 +5833,7 @@ static int uniwill_probe(struct platform_device *pdev)
 	struct uniwill_data *data;
 	struct regmap *regmap;
 	acpi_handle handle;
+	unsigned int value;
 	int ret;
 
 	handle = ACPI_HANDLE(&pdev->dev);
@@ -5769,12 +5853,18 @@ static int uniwill_probe(struct platform_device *pdev)
 		return PTR_ERR(regmap);
 
 	data->regmap = regmap;
+	data->features = device_descriptor.features;
+	data->kbd_led_max_brightness = device_descriptor.kbd_led_max_brightness;
+	data->lightbar_max_brightness = device_descriptor.lightbar_max_brightness;
+	data->num_profiles = device_descriptor.num_profiles;
+	data->custom_profile_mode_needed = device_descriptor.custom_profile_mode_needed;
+	memcpy(data->tdp_max, device_descriptor.tdp_max, sizeof(data->tdp_max));
 
 	ret = devm_mutex_init(&pdev->dev, &data->super_key_lock);
 	if (ret < 0)
 		return ret;
 
-	ret = usb_c_power_priority_init(data);
+	ret = devm_mutex_init(&pdev->dev, &data->power_lock);
 	if (ret < 0)
 		return ret;
 
@@ -5782,11 +5872,9 @@ static int uniwill_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
-	data->features = device_descriptor.features;
-	data->kbd_led_max_brightness = device_descriptor.kbd_led_max_brightness;
-	data->lightbar_max_brightness = device_descriptor.lightbar_max_brightness;
-	data->num_profiles = device_descriptor.num_profiles;
-	data->custom_profile_mode_needed = device_descriptor.custom_profile_mode_needed;
+	ret = usb_c_power_priority_init(data);
+	if (ret < 0)
+		return ret;
 
 	if (uniwill_device_supports(data, UNIWILL_FEATURE_BATTERY_CHARGE_LIMIT))
 		allow_charge_limit = true;
@@ -5832,6 +5920,16 @@ static int uniwill_probe(struct platform_device *pdev)
 		ret = devm_mutex_init(&pdev->dev, &data->wc.lock);
 		if (ret < 0)
 			return ret;
+
+		ret = regmap_read(data->regmap, EC_ADDR_COOLING_MODE, &value);
+		if (ret < 0)
+			return ret;
+		data->wc.enable = !!(value & COOLING_MODE_LC_ACTIVE);
+
+		ret = regmap_read(data->regmap, EC_ADDR_OEM_3, &value);
+		if (ret < 0)
+			return ret;
+		data->oem_high_power_active = !!(value & OVERBOOST);
 		data->wc.fan_mode = 2;
 	}
 
@@ -5889,11 +5987,11 @@ static int uniwill_probe(struct platform_device *pdev)
 
 	uniwill_set_app_presence(data);
 
-	ret = uniwill_profile_init(data);
+	ret = uniwill_custom_profile_init(data);
 	if (ret < 0)
 		return ret;
 
-	ret = uniwill_custom_profile_init(data);
+	ret = uniwill_profile_init(data);
 	if (ret < 0)
 		return ret;
 
@@ -6172,54 +6270,26 @@ static int uniwill_resume_usb_c_power_priority(struct uniwill_data *data)
 	return usb_c_power_priority_restore(data);
 }
 
-static int uniwill_resume_profile(struct uniwill_data *data)
+static int uniwill_resume_water_cooler(struct uniwill_data *data)
 {
-	int profile_idx;
-	int ret;
-
-	if (data->num_profiles == 0)
+	if (!uniwill_device_supports(data, UNIWILL_FEATURE_WATER_COOLER))
 		return 0;
 
-	switch (data->last_profile_ctrl & PROFILE_MODE_MASK) {
-	case PROFILE_QUIET:
-		profile_idx = 0;
-		break;
-	case PROFILE_PERFORMANCE:
-		profile_idx = data->overboost_active ? 3 : 2;
-		break;
-	default:
-		profile_idx = 1;
-		break;
-	}
-
-	/*
-	 * Re-apply profile mode first, then PL values. The EC firmware
-	 * may only apply PL writes when the target profile is active.
-	 */
-	ret = regmap_update_bits(data->regmap, EC_ADDR_MANUAL_FAN_CTRL,
-				 PROFILE_MODE_MASK,
-				 data->last_profile_ctrl & PROFILE_MODE_MASK);
-	if (ret < 0)
-		return ret;
-
-	ret = uniwill_write_pl_values(data, profile_idx);
-	if (ret < 0)
-		return ret;
-
-	/* Re-apply overboost (VRM current + OVERBOOST bit) after resume */
-	if (data->overboost_active)
-		return uniwill_set_overboost(data, true);
-
-	return 0;
+	return regmap_update_bits(data->regmap, EC_ADDR_COOLING_MODE,
+				  COOLING_MODE_LC_ACTIVE,
+				  data->wc.enable ? COOLING_MODE_LC_ACTIVE : 0);
 }
 
-static int uniwill_resume_custom_profile(struct uniwill_data *data)
+static int uniwill_resume_profile(struct uniwill_data *data)
 {
-	if (!data->custom_profile_mode_needed)
-		return 0;
+	enum platform_profile_option profile;
 
-	return regmap_set_bits(data->regmap, EC_ADDR_CUSTOM_PROFILE,
-			       CUSTOM_PROFILE_MODE);
+	if (data->num_profiles == 0)
+		return uniwill_enable_custom_profile_mode(data);
+
+	profile = uniwill_platform_profile_from_ec(data->last_profile_ctrl);
+
+	return uniwill_apply_profile(data, profile);
 }
 
 static int uniwill_resume_fan_mode(struct uniwill_data *data)
@@ -6310,11 +6380,11 @@ static int uniwill_resume(struct device *dev)
 	if (ret < 0)
 		return ret;
 
-	ret = uniwill_resume_profile(data);
+	ret = uniwill_resume_water_cooler(data);
 	if (ret < 0)
 		return ret;
 
-	ret = uniwill_resume_custom_profile(data);
+	ret = uniwill_resume_profile(data);
 	if (ret < 0)
 		return ret;
 
@@ -6536,12 +6606,14 @@ static struct uniwill_device_descriptor tux_featureset_3_cpm_descriptor __initda
 static struct uniwill_device_descriptor gmxhgxx_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 90, 90, 100 },
 };
 
 /* TUXEDO Stellaris Slim 15 Gen6 Intel (GM5IXxA) */
 static struct uniwill_device_descriptor gm5ixxa_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 140, 140, 200 },
 };
 
 /* TUXEDO Stellaris 16 Gen6 Intel MB1 (GM6IXxB_MB1) */
@@ -6549,6 +6621,7 @@ static struct uniwill_device_descriptor gm6ixxb_mb1_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
 		    UNIWILL_FEATURE_WATER_COOLER,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 205, 205, 400 },
 };
 
 /* TUXEDO Stellaris 16 Gen6 Intel MB2 (GM6IXxB_MB2) */
@@ -6556,6 +6629,7 @@ static struct uniwill_device_descriptor gm6ixxb_mb2_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
 		    UNIWILL_FEATURE_WATER_COOLER,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 160, 160, 250 },
 };
 
 /* TUXEDO Stellaris 17 Gen6 Intel (GM7IXxN) */
@@ -6563,6 +6637,7 @@ static struct uniwill_device_descriptor gm7ixxn_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES |
 		    UNIWILL_FEATURE_WATER_COOLER,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 160, 160, 250 },
 };
 
 /* TUXEDO Stellaris 16 Gen7 Intel (X6AR5xxY / X6AR5xxY_mLED) */
@@ -6573,6 +6648,7 @@ static struct uniwill_device_descriptor x6ar5xxy_descriptor __initdata = {
 		    UNIWILL_FEATURE_TCC_OFFSET,
 	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 210, 210, 420 },
 	.has_hidden_bios_options = true,
 };
 
@@ -6584,6 +6660,7 @@ static struct uniwill_device_descriptor x6fr5xxy_descriptor __initdata = {
 		    UNIWILL_FEATURE_TCC_OFFSET,
 	.num_profiles = 3,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 162, 162, 195 },
 	.fan_table_format = UNIWILL_FAN_TABLE_RAMFAN1P5,
 };
 
@@ -6591,24 +6668,28 @@ static struct uniwill_device_descriptor x6fr5xxy_descriptor __initdata = {
 static struct uniwill_device_descriptor x5kk45xs_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 100, 100, 105 },
 };
 
 /* TUXEDO InfinityBook Max 16 Gen10 AMD (X6KK45xU_X6SP45xU) */
 static struct uniwill_device_descriptor x6kk45xu_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 100, 100, 105 },
 };
 
 /* TUXEDO InfinityBook Max 15 Gen10 Intel (X5AR45xS) */
 static struct uniwill_device_descriptor x5ar45xs_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 90, 90, 230 },
 };
 
 /* TUXEDO InfinityBook Max 16 Gen10 Intel (X6AR55xU) */
 static struct uniwill_device_descriptor x6ar55xu_descriptor __initdata = {
 	.features = TUX_FEATURESET_3_NVIDIA_CPM_FEATURES,
 	.custom_profile_mode_needed = true,
+	.tdp_max = { 145, 155, 290 },
 	.has_hidden_bios_options = true,
 };
 
@@ -7113,6 +7194,14 @@ static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "SchenkerTechnologiesGmbH"),
 			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6FR5xxY"),
+		},
+		.driver_data = &x6fr5xxy_descriptor,
+	},
+	{
+		.ident = "AiStone X6FR558Y",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "AiStone"),
+			DMI_EXACT_MATCH(DMI_BOARD_NAME, "X6FR558Y"),
 		},
 		.driver_data = &x6fr5xxy_descriptor,
 	},
